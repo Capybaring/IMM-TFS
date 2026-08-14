@@ -115,7 +115,7 @@ def compute_all_losses(
             batch_dict["observed_tp"],
             batch_dict["observed_mask"],
             notes_input=batch_dict["notes_embeddings"],
-            tau=batch_dict.get("tau_raw", batch_dict["tau"]),
+            tau=batch_dict["tau"],
         )
     else:
         pred_y = model.forecasting(
@@ -261,7 +261,7 @@ def evaluation(model, fusion, dataloader, enable_text=True, use_text_embeddings=
                 batch_dict["observed_tp"],
                 batch_dict["observed_mask"],
                 notes_input=batch_dict["notes_embeddings"],
-                tau=batch_dict.get("tau_raw", batch_dict["tau"]),
+                tau=batch_dict["tau"],
             )
         else:
             pred_y = model.forecasting(

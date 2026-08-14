@@ -15,8 +15,7 @@ Key differences from the original generic loader:
 2. preserve the synthetic episode anchor (e.g. 2000-01-01 00:00:00);
 3. split at subject level before normalization;
 4. v2/debug mode: normalization is fitted on the current TRAIN HISTORY;
-5. v3/fixed mode: train/val/test IDs are persisted once, while each Train_N
-   fits its OWN feature-wise scaler from Train_N HISTORY only;
+5. v3/fixed mode: a persisted FULL-TRAIN-HISTORY scaler is applied to every N;
 6. dataset tensors stay on CPU; only mini-batches move to GPU;
 7. text exposes both:
        tau_raw : raw dataset units (hours for MIMIC)
@@ -720,13 +719,20 @@ def _load_fixed_protocol(dataset_path: str):
     with open(protocol_path, "r", encoding="utf-8") as f:
         protocol = json.load(f)
 
-    if protocol.get("version") != "3-per-n-normalization":
-        raise RuntimeError(
-            "Fixed MIMIC protocol is from an older v3 variant. "
-            "Rebuild it once with: "
-            "python scripts/prepare_mimic_fixed_protocol.py --force"
+    norm_path = os.environ.get("MIMIC_NORMALIZATION_PATH")
+    if not norm_path:
+        norm_path = os.path.join(
+            os.path.dirname(protocol_path),
+            protocol.get("normalization_file", "mimic_fixed_normalization.pt"),
         )
-    return protocol, protocol_path
+    if not os.path.isabs(norm_path):
+        norm_path = os.path.abspath(norm_path)
+    if not os.path.isfile(norm_path):
+        raise FileNotFoundError(f"Fixed MIMIC normalization not found: {norm_path}")
+
+    norm = _load_torch_payload(norm_path)
+    return protocol, norm, protocol_path, norm_path
+
 
 def _records_for_subjects(subjects, subject_to_records):
     records = []
@@ -896,14 +902,14 @@ def parse_datasets(args, show_summary=True):
         args.split_method = "instance"
 
     fixed_mode = _fixed_protocol_enabled()
-    protocol = None
-    protocol_path = None
+    protocol = norm_payload = None
+    protocol_path = norm_path = None
     fixed_train_n = None
     fixed_selected_subjects = None
     fixed_train_records = fixed_val_records = fixed_test_records = None
 
     if fixed_mode:
-        protocol, protocol_path = _load_fixed_protocol(dataset_path)
+        protocol, norm_payload, protocol_path, norm_path = _load_fixed_protocol(dataset_path)
 
         # -n means TRAIN SUBJECT COUNT in fixed mode.
         requested_train_n = int(getattr(args, "n", int(1e8)))
@@ -961,14 +967,12 @@ def parse_datasets(args, show_summary=True):
         val_idx = [rec_to_idx[r] for r in fixed_val_records]
         test_idx = [rec_to_idx[r] for r in fixed_test_records]
 
-        # Formal scaling protocol: every Train_N fits its OWN scaler from
-        # exactly those N training subjects and HISTORY [0, history) only.
-        # This keeps N=200 from using statistics from the rest of the 12,145
-        # subject train pool. Uni/Multi at the same N deterministically obtain
-        # identical mean/std because they use the exact same train IDs.
-        ds.fit_and_apply_train_history_normalization(train_idx)
-        ds.normalization_source = (
-            f"fixed protocol Train_N={fixed_train_n}; history observations only"
+        ds.apply_precomputed_normalization(
+            feature_cols=list(norm_payload["feature_cols"]),
+            mean=norm_payload["mean"],
+            std=norm_payload["std"],
+            count=norm_payload.get("count"),
+            source=str(norm_payload.get("source", "fixed full-train history")),
         )
 
         # Keep model dimensions constant across N, rather than letting a rare
@@ -980,14 +984,14 @@ def parse_datasets(args, show_summary=True):
         print("Expanded MIMIC FIXED/NESTED scaling protocol")
         print("=" * 72)
         print(f"protocol file          : {protocol_path}")
-        print("normalization file     : none (fitted per Train_N at run time)")
+        print(f"normalization file     : {norm_path}")
         print(f"full cohort subjects   : {int(protocol['subject_count']):,}")
         print(f"full train subjects    : {len(protocol['train_subject_order']):,}")
         print(f"TRAIN subjects used    : {fixed_train_n:,}")
         print(f"VAL subjects fixed     : {int(protocol['val_subject_count']):,}")
         print(f"TEST subjects fixed    : {int(protocol['test_subject_count']):,}")
         print("nested train rule      : prefix of one persisted random train order")
-        print(f"normalization          : Train_N={fixed_train_n} HISTORY-only z-score")
+        print("normalization          : fixed FULL-TRAIN HISTORY z-score")
         print("-n semantics           : TRAIN SUBJECT COUNT")
         print("=" * 72)
     else:
@@ -1081,8 +1085,7 @@ def parse_datasets(args, show_summary=True):
             "val_records": list(fixed_val_records),
             "test_records": list(fixed_test_records),
             "protocol_path": protocol_path,
-            "normalization_path": None,
-            "normalization_scope": f"Train_N={fixed_train_n} history only",
+            "normalization_path": norm_path,
         }
     return out
 
