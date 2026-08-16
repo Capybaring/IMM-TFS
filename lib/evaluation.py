@@ -93,13 +93,11 @@ def compute_all_losses(
     # Make predictions for all the points
     # shape of pred --- [n_traj_samples=1, n_batch, n_tp, n_dim]
 
-    # GPINet (2026-08-09): if this is GPINet and text is enabled with
-    # precomputed embeddings, route text natively into forecasting() (pooled
-    # onto the GP's own query grid, merged before the backbone) instead of
-    # via the generic post-hoc fusion() call below -- see models/GPINet.py's
-    # module docstring. use_text_embeddings=False (raw-text fallback) is not
-    # supported by this path since GPTextPooler only accepts precomputed
-    # embeddings; falls back to the generic fusion() path in that case.
+    # GPINet: with precomputed embeddings, route the K timestamped reports
+    # natively into forecasting(). MTGNN variable nodes attend to the report
+    # event set inside the backbone; no 24-point text pseudo-series and no
+    # generic post-hoc output fusion are used. Raw-text fallback remains on
+    # the generic path because the native encoder expects embeddings.
     # Every other model, and GPINet with this disabled, is unaffected.
     use_native_gpinet_text = (
         enable_text
@@ -235,6 +233,8 @@ def evaluation(model, fusion, dataloader, enable_text=True, use_text_embeddings=
 
     n_eval_samples = 0
     n_eval_samples_mape = 0
+    text_gate_values = []
+    text_attention_entropy_values = []
     total_results = {}
     total_results["loss"] = 0
     total_results["mse"] = 0
@@ -270,6 +270,16 @@ def evaluation(model, fusion, dataloader, enable_text=True, use_text_embeddings=
                 batch_dict["observed_tp"],
                 batch_dict["observed_mask"],
             )
+
+        if use_native_gpinet_text:
+            gate_mean = getattr(model, "last_text_gate_mean", None)
+            attention_entropy = getattr(
+                model, "last_text_attention_entropy", None
+            )
+            if gate_mean is not None:
+                text_gate_values.append(float(gate_mean))
+            if attention_entropy is not None:
+                text_attention_entropy_values.append(float(attention_entropy))
 
         if enable_text and fusion is not None and not use_native_gpinet_text:
             notes_input = (
@@ -341,5 +351,12 @@ def evaluation(model, fusion, dataloader, enable_text=True, use_text_embeddings=
         if isinstance(var, torch.Tensor):
             var = var.item()
         total_results[key] = var
+
+    if text_gate_values:
+        total_results["text_gate_mean"] = float(np.mean(text_gate_values))
+    if text_attention_entropy_values:
+        total_results["text_attention_entropy"] = float(
+            np.mean(text_attention_entropy_values)
+        )
 
     return total_results

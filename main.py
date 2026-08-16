@@ -688,6 +688,15 @@ def get_args_from_parser() -> argparse.Namespace:
         help="Number of attention heads for Fusion modules",
     )
     parser.add_argument(
+        "--gpinet_text_gate_bias",
+        type=float,
+        default=-1.0,
+        help=(
+            "Initial bias of GPINet's internal variable-text gate. "
+            "The default starts with a conservative but trainable text update."
+        ),
+    )
+    parser.add_argument(
         "--kappa",
         type=float,
         default=0.5,
@@ -1014,7 +1023,19 @@ def trainable(
     args.input_len, args.pred_len = get_input_and_pred_len(data_obj)
     model_class = globals()[args.model]
     model = model_class(args).to(args.device)
-    fusion = FusionModel(args).to(args.device) if args.enable_text else None
+    use_native_gpinet_text = bool(
+        args.enable_text
+        and args.model == "GPINet"
+        and args.use_text_embeddings
+    )
+    # GPINet consumes report events inside its MTGNN backbone. Constructing a
+    # second generic output-level FusionModel would add unused parameters to
+    # the optimizer and make the configured TTF/MMF flags misleading.
+    fusion = (
+        FusionModel(args).to(args.device)
+        if args.enable_text and not use_native_gpinet_text
+        else None
+    )
 
     ##################################################################
 
@@ -1042,11 +1063,9 @@ def trainable(
     logger.info(args)
 
     # Set trainable_parameters
-    if not args.enable_text:
-        trainable_parameters = list(model.parameters())
-    else:
-        assert fusion is not None
-        trainable_parameters = list(model.parameters()) + list(fusion.parameters())
+    trainable_parameters = list(model.parameters())
+    if fusion is not None:
+        trainable_parameters += list(fusion.parameters())
 
     optimizer = optim.Adam(trainable_parameters, lr=args.lr, weight_decay=args.w_decay)
 
@@ -1107,7 +1126,11 @@ def trainable(
                     if args.use_amp:
                         with autocast():
                             train_res = compute_all_losses(
-                                model, fusion, batch_dict, args.enable_text
+                                model,
+                                fusion,
+                                batch_dict,
+                                args.enable_text,
+                                args.use_text_embeddings,
                             )
                             loss = train_res["loss"]
                         scaler.scale(loss).backward()
@@ -1118,7 +1141,11 @@ def trainable(
                         scaler.update()
                     else:
                         train_res = compute_all_losses(
-                            model, fusion, batch_dict, args.enable_text
+                            model,
+                            fusion,
+                            batch_dict,
+                            args.enable_text,
+                            args.use_text_embeddings,
                         )
                         loss = train_res["loss"]
                         loss.backward()
@@ -1152,7 +1179,11 @@ def trainable(
             fusion.eval()
         with torch.no_grad():
             val_res = evaluation(
-                model, fusion, data_obj["val_dataloader"], args.enable_text
+                model,
+                fusion,
+                data_obj["val_dataloader"],
+                args.enable_text,
+                args.use_text_embeddings,
             )
 
             # Compute improvement over best MSE
@@ -1165,7 +1196,11 @@ def trainable(
 
                 ### Testing ###
                 test_res = evaluation(
-                    model, fusion, data_obj["test_dataloader"], args.enable_text
+                    model,
+                    fusion,
+                    data_obj["test_dataloader"],
+                    args.enable_text,
+                    args.use_text_embeddings,
                 )
             else:
                 no_improve_counter += 1
@@ -1181,6 +1216,13 @@ def trainable(
                     val_res["mae"],
                 )
             )
+            if "text_gate_mean" in val_res:
+                logger.info(
+                    "Val - Text gate mean, attention entropy: {:.5f}, {:.5f}".format(
+                        val_res["text_gate_mean"],
+                        val_res.get("text_attention_entropy", float("nan")),
+                    )
+                )
             if test_res != None:
                 logger.info(
                     "Test - Best epoch, Loss, MSE, MAE: {}, {:.5f}, {:.5f}, {:.5f}".format(

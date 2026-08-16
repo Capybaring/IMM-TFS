@@ -9,30 +9,18 @@ the project root (models/gpinet_mm.py), this file:
     (see models/tPatchGNN.py, models/CRU.py), so it plugs into the same
     training loop, evaluation code, and text FusionModel as every other
     baseline.
-  - by default has NO built-in text fusion, same as every other model here:
-    multimodality is handled uniformly by fusions/FusionModel.py, applied on
-    top of this model's numeric-only output (Y_ts) in main.py's training
-    loop. This is what makes the GPINet-vs-tPatchGNN Uni/generic-Multi
-    comparison isolate the backbone as the only variable.
-  - ALSO optionally supports a second, native text-fusion path (added
-    2026-08-09): forecasting() accepts optional `notes_input`/`tau` kwargs
-    (default None, so every existing call site and every other model is
-    unaffected). When provided, a GPTextPooler (see below) pools the note
-    embeddings onto the GP's own history-side query grid `t_query`, and
-    GPTextGatedMerge merges them into `fused` via a learned per-position
-    sigmoid gate (updated 2026-08-09 from an earlier plain concat+1x1-conv
-    version, which had no way to suppress unhelpful text and empirically
-    made Multi worse than Uni -- see fusions/MMF_GR_Add.py for the
-    analogous idea in the generic post-hoc path) *before* self.backbone(),
-    instead of only ever correcting an already-finished Y_ts post-hoc like
-    the generic FusionModel does. lib/evaluation.py routes text through this
-    path instead of the generic FusionModel specifically for GPINet
-    (isinstance check) when enabled; every other model is untouched. This
-    means "GPINet + native fusion" and "GPINet + generic FusionModel" are no
-    longer directly comparable to other backbones on equal footing the way
-    Uni numbers are -- keep both GPINet rows (generic and native) in any
-    results table so the delta attributable to the fusion design itself is
-    visible, rather than conflating it with "GPINet's backbone is better."
+  - keeps the original numeric-only path when text is disabled. When text is
+    enabled with precomputed embeddings, GPINet uses its native feature-level
+    path and does not invoke the repository's generic post-hoc FusionModel.
+  - optionally supports native, feature-level text fusion. Each report stays
+    an independent event token carrying its own timestamp. MTGNN variable
+    nodes query this event set *inside every temporal/graph block*; reports
+    are never resampled or spread onto the 24-point GP grid. The attended
+    text message is written into the node hidden state before graph
+    propagation, so the numerical backbone itself learns the multimodal
+    representation rather than receiving a post-hoc output correction.
+    lib/evaluation.py routes precomputed text embeddings through this path
+    specifically for GPINet when text is enabled.
   - queries the decoder at the batch's actual `time_steps_to_predict`
     (variable, padded, continuous) instead of a fixed internal grid, since
     IMM-TSF's standard collate does not guarantee a fixed prediction length
@@ -162,21 +150,13 @@ class GaussHermiteFusionModule(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Native text fusion (optional; see module docstring). Deliberately
-# reimplemented here rather than importing fusions/TTF_RecAvg.py, to (a)
-# keep this file's no-cross-package-import design intact, and (b) pool text
-# onto the GP's *history-side* query grid t_query instead of the
-# *prediction-side* query times t_hat that fusions/TTF_*.py use -- those are
-# different axes (t_query in [0, history_frac], t_hat in
-# [history_frac, 1]) serving different purposes (encoder-side context here,
-# vs. post-hoc decoder-side correction there).
+# Native text fusion. Reports remain a variable-length event set; no text
+# pseudo-sequence is created on the GP query grid.
 # ─────────────────────────────────────────────────────────────────────────
 
 
 class _GPTime2Vec(nn.Module):
-    """Same idea as fusions/TTF_T2V_XAttn.py's Time2Vec (linear trend +
-    periodic terms), reimplemented here in ~5 lines to keep this file
-    self-contained rather than importing it."""
+    """Compact Time2Vec used to retain each report's original event time."""
 
     def __init__(self, d_tau: int):
         super().__init__()
@@ -190,140 +170,158 @@ class _GPTime2Vec(nn.Module):
         return torch.cat([lin, per], dim=-1)
 
 
-class GPTextPooler(nn.Module):
-    """Cross-attention pooling of note embeddings onto the GP's t_query grid
-    (updated 2026-08-09 from an earlier Gaussian-proximity-weighted-average
-    version -- kept the class name so call sites in GPINet.__init__/
-    forecasting() don't need to change).
+class TextEventEncoder(nn.Module):
+    """Encode K independent report events without inventing a time grid.
 
-    Same spirit as fusions/TTF_T2V_XAttn.py (Time2Vec-augmented multi-head
-    cross-attention over note embeddings), with two deliberate differences
-    motivated by t_query being a FIXED, batch-independent grid (unlike
-    TTF_T2V_XAttn's t_hat, which is a different, data-dependent set of
-    future prediction times for every chunk):
-
-      1. The attention query is a per-grid-position LEARNED embedding table
-         (`self.query_embed`, shape (Q, hid_dim)) instead of one constant
-         vector broadcast to every position. TTF_T2V_XAttn's query
-         (`self.Q_param`) is identical for every one of its T_f future
-         steps regardless of t_hat -- meaning its attention weights over
-         notes can't actually vary by *which* future time is being queried,
-         only by the notes' own timestamps. That's a real limitation there
-         (see prior discussion), but here t_query is always the same Q
-         values for every sample/batch (it doesn't depend on data at all --
-         it's `linspace(0, history_frac, n_query)`, fixed at construction),
-         so a learned embedding table indexed by grid position is a strictly
-         more expressive, still-simple fix: each of the Q query points gets
-         its own distinct, trainable query vector.
-      2. `tau` is normalized (divided by total_window) before Time2Vec, for
-         the same reason as the previous pooling version -- t_query lives in
-         [0, history_frac], tau (as delivered in batch_dict) does not,
-         unless rescaled. (fusions/TTF_RecAvg.py and TTF_T2V_XAttn.py do NOT
-         do this normalization for tau vs. t_hat -- known, currently unfixed
-         issue, see project notes; left alone here on purpose so this
-         module's correctness doesn't depend on that separate bug.)
+    The loader supplies zero-padded report embeddings and raw timestamps in
+    hours. Padding is inferred from all-zero embeddings. A safe dummy token is
+    created only for an all-empty sample/batch so MultiheadAttention never
+    receives an all-masked key row; `has_text` later makes that path an exact
+    no-op.
     """
 
     def __init__(
         self,
         d_txt_in: int,
         hid_dim: int,
-        total_window: float,
-        n_query: int,
-        n_heads: int = 1,
+        history_window: float,
         dropout: float = 0.1,
     ):
         super().__init__()
-        self.total_window = float(total_window)
+        self.history_window = float(history_window)
         self.proj_in = nn.Linear(d_txt_in, hid_dim)
         self.d_tau = max(hid_dim // 2, 2)
         self.time2vec = _GPTime2Vec(self.d_tau)
         self.kv_proj = nn.Linear(hid_dim + self.d_tau, hid_dim)
-        self.query_embed = nn.Parameter(torch.randn(n_query, hid_dim) * 0.02)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=hid_dim, num_heads=n_heads, dropout=dropout, batch_first=True
-        )
         self.layer_norm = nn.LayerNorm(hid_dim)
         self.dropout = nn.Dropout(dropout)
-        self.proj_out = nn.Linear(hid_dim, hid_dim)
 
-    def forward(
-        self, notes_input: torch.Tensor, tau: torch.Tensor, t_query: torch.Tensor
-    ):
+    def forward(self, notes_input: torch.Tensor, tau: torch.Tensor):
         """
-        notes_input: (B, N_max, d_txt_in) precomputed note embeddings, zero-padded
-        tau:         (B, N_max) RAW (unnormalized) note timestamps, zero-padded
-        t_query:     (Q,) the GP's fixed, normalized [0, history_frac] query
-            grid -- NOT used numerically here (query_embed already encodes
-            grid position by construction), kept as an argument only for
-            interface symmetry with the earlier pooling version / in case
-            the grid ever becomes data-dependent later.
+        notes_input:     (B, K_max, d_txt_in), zero-padded report embeddings
+        tau:             (B, K_max), raw report timestamps in history units
         returns:
-          pooled:   (B, hid_dim, Q) text summary at each t_query point
-          has_text: (B,) bool, whether this sample has >= 1 real note
+          tokens:          (B, max(K_max, 1), hid_dim)
+          padding_mask:    (B, max(K_max, 1)); True means ignore
+          has_text:        (B,) bool
         """
-        B, N_max, _ = notes_input.shape
-        Q = self.query_embed.shape[0]
+        if notes_input.ndim != 3:
+            raise ValueError(
+                "notes_input must have shape (B, K_max, d_txt_in), got "
+                f"{tuple(notes_input.shape)}"
+            )
+        if tau.ndim != 2 or tau.shape[:2] != notes_input.shape[:2]:
+            raise ValueError(
+                "tau must have shape (B, K_max) matching notes_input; got "
+                f"notes={tuple(notes_input.shape)}, tau={tuple(tau.shape)}"
+            )
 
-        note_mask = notes_input.abs().sum(dim=-1) > 0  # (B, N_max)
-        has_text = note_mask.any(dim=1)  # (B,)
+        batch_size, n_notes, _ = notes_input.shape
+        if n_notes == 0:
+            tokens = notes_input.new_zeros((batch_size, 1, self.proj_in.out_features))
+            padding_mask = torch.zeros(
+                (batch_size, 1), dtype=torch.bool, device=notes_input.device
+            )
+            has_text = torch.zeros(
+                batch_size, dtype=torch.bool, device=notes_input.device
+            )
+            return tokens, padding_mask, has_text
 
-        tau_norm = tau / self.total_window  # match t_query's [0,1] scale
+        note_mask = notes_input.abs().sum(dim=-1) > 0
+        has_text = note_mask.any(dim=1)
+        tau_norm = (tau / self.history_window).clamp(0.0, 1.0)
 
-        V = self.proj_in(notes_input)  # (B, N_max, hid_dim)
-        tau_feat = self.time2vec(tau_norm.unsqueeze(-1))  # (B, N_max, d_tau)
-        KV = self.kv_proj(torch.cat([V, tau_feat], dim=-1))  # (B, N_max, hid_dim)
+        content = self.proj_in(notes_input)
+        tau_feat = self.time2vec(tau_norm.unsqueeze(-1))
+        tokens = self.kv_proj(torch.cat([content, tau_feat], dim=-1))
+        tokens = self.dropout(self.layer_norm(tokens))
+        tokens = tokens * note_mask.unsqueeze(-1).to(tokens.dtype)
 
-        Qmat = self.query_embed.unsqueeze(0).expand(B, -1, -1)  # (B, Q, hid_dim)
-        key_padding_mask = ~note_mask  # (B, N_max); True = ignore this key
+        padding_mask = ~note_mask
+        empty_rows = ~has_text
+        if empty_rows.any():
+            # Keep a single zero dummy token visible to attention. The
+            # injection mask below guarantees it cannot affect the numeric path.
+            padding_mask = padding_mask.clone()
+            padding_mask[empty_rows, 0] = False
+            tokens = tokens.clone()
+            tokens[empty_rows, 0] = 0.0
 
-        attn_out, _ = self.attn(Qmat, KV, KV, key_padding_mask=key_padding_mask)
-        # Samples with zero real notes have an all-True key_padding_mask row,
-        # which MultiheadAttention can turn into NaN (softmax over nothing);
-        # zero those rows out explicitly, same pattern fusions/TTF_T2V_XAttn.py
-        # uses for the same edge case.
-        has_text_bc = has_text.view(B, 1, 1)
-        attn_out = torch.where(has_text_bc, attn_out, torch.zeros_like(attn_out))
-
-        pooled = self.layer_norm(attn_out + Qmat)  # residual, like TTF_T2V_XAttn
-        pooled = self.dropout(pooled)
-        pooled = self.proj_out(pooled)  # (B, Q, hid_dim)
-
-        return pooled.permute(0, 2, 1), has_text  # (B, hid_dim, Q), (B,)
+        return tokens, padding_mask, has_text
 
 
-class GPTextGatedMerge(nn.Module):
-    """Gated residual merge of text-pooled features into `fused`.
+class VariableTextInjection(nn.Module):
+    """Let numerical MTGNN variable nodes read the K report-event tokens.
 
-    Analogous in spirit to fusions/MMF_GR_Add.py's GRU-gated residual (which
-    the paper's own ablation found more robust than a fixed-weight blend
-    like MMF_XAttn_Add -- it can learn to shut text off where it isn't
-    helpful instead of always contributing a fixed-size correction). Uses a
-    1x1 Conv2d instead of a GRU since `fused`/text_pooled live on GPINet's
-    (N, Q+1) grid, not a 1D time axis.
-
-    g (per-channel/node/grid-position, in [0,1]) close to 1 -> ignore text,
-    pass `fused` through unchanged. g close to 0 -> fully apply the
-    text-informed residual. Forced to g=1 (exact no-op) for samples with no
-    notes in this chunk, so a missing/empty note list can never perturb the
-    numeric branch even slightly.
+    Queries are produced from each variable's numerical hidden trajectory,
+    plus a learned variable identity. The resulting variable-specific text
+    message is injected as static patient context before graph propagation;
+    it is not interpreted as a report observed at each hourly grid point.
     """
 
-    def __init__(self, hid_dim: int):
+    def __init__(
+        self,
+        num_nodes: int,
+        hidden: int,
+        n_heads: int = 1,
+        dropout: float = 0.1,
+        gate_bias: float = -1.0,
+    ):
         super().__init__()
-        self.residual_conv = nn.Conv2d(2 * hid_dim, hid_dim, 1)
-        self.gate_conv = nn.Conv2d(2 * hid_dim, hid_dim, 1)
+        if hidden % n_heads != 0:
+            raise ValueError(
+                f"hidden={hidden} must be divisible by n_heads={n_heads}"
+            )
+        self.variable_embed = nn.Parameter(torch.randn(num_nodes, hidden) * 0.02)
+        self.query_norm = nn.LayerNorm(hidden)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=hidden,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.context_norm = nn.LayerNorm(hidden)
+        self.delta = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+        )
+        self.gate = nn.Linear(2 * hidden, hidden)
+        nn.init.constant_(self.gate.bias, gate_bias)
+        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, fused, text_pooled, has_text_mask):
+    def forward(self, h, text_tokens, text_padding_mask, has_text):
         """
-        fused, text_pooled: (B, hid_dim, N, Q+1)
-        has_text_mask:      (B, 1, 1, 1) float/bool, broadcastable
+        h:                 (B, hidden, N, T)
+        text_tokens:       (B, K, hidden)
+        text_padding_mask: (B, K), True means ignore
+        has_text:          (B,) bool
         """
-        x = torch.cat([fused, text_pooled], dim=1)  # (B, 2*hid_dim, N, Q+1)
-        delta = self.residual_conv(x)
-        g = torch.sigmoid(self.gate_conv(x))
-        g = torch.where(has_text_mask.bool(), g, torch.ones_like(g))
-        return g * fused + (1 - g) * (fused + delta)
+        batch_size, hidden, num_nodes, _ = h.shape
+        variable_state = h.mean(dim=-1).permute(0, 2, 1)
+        query = self.query_norm(
+            variable_state + self.variable_embed.unsqueeze(0)
+        )
+
+        context, attn_weights = self.attn(
+            query,
+            text_tokens,
+            text_tokens,
+            key_padding_mask=text_padding_mask,
+            need_weights=True,
+        )
+        has_text_bnc = has_text.view(batch_size, 1, 1)
+        context = torch.where(
+            has_text_bnc, self.context_norm(context), torch.zeros_like(context)
+        )
+
+        gate = torch.sigmoid(self.gate(torch.cat([query, context], dim=-1)))
+        update = gate * self.delta(context)
+        update = update * has_text_bnc.to(update.dtype)
+        update = self.dropout(update).permute(0, 2, 1).unsqueeze(-1)
+
+        return h + update, attn_weights, gate
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -385,6 +383,9 @@ class MTGNNEncoder(nn.Module):
         dropout=0.3,
     ):
         super().__init__()
+        self.num_nodes = int(num_nodes)
+        self.hidden = int(hidden)
+        self.n_layers = int(layers)
         self.seq_length = seq_length
         self.start = nn.Conv2d(in_channels, hidden, 1)
         self.graph = GraphConstructor(num_nodes, subgraph_size, node_dim=node_dim)
@@ -402,17 +403,94 @@ class MTGNNEncoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.temporal_agg = nn.Linear(hidden * seq_length, hid_dim)
 
-    def forward(self, x):
+        # Configured by GPINet only after every numeric-path module has been
+        # initialized. Keeping text construction separate preserves the
+        # numerical parameter initialization used by Uni runs.
+        self.text_event_encoder = None
+        self.text_injections = nn.ModuleList()
+        self.last_text_gate_mean = None
+        self.last_text_attention_entropy = None
+
+    def configure_text_fusion(
+        self,
+        d_txt_in,
+        history_window,
+        n_heads=1,
+        dropout=0.1,
+        gate_bias=-1.0,
+    ):
+        """Attach feature-level text modules to every MTGNN block."""
+        self.text_event_encoder = TextEventEncoder(
+            d_txt_in=int(d_txt_in),
+            hid_dim=self.hidden,
+            history_window=float(history_window),
+            dropout=float(dropout),
+        )
+        self.text_injections = nn.ModuleList(
+            [
+                VariableTextInjection(
+                    num_nodes=self.num_nodes,
+                    hidden=self.hidden,
+                    n_heads=int(n_heads),
+                    dropout=float(dropout),
+                    gate_bias=float(gate_bias),
+                )
+                for _ in range(self.n_layers)
+            ]
+        )
+
+    def forward(self, x, notes_input=None, tau=None):
         # x: (B, C_in, N, T)
         if x.shape[-1] != self.seq_length:
             raise ValueError(f"MTGNNEncoder expected sequence length {self.seq_length}, got {x.shape[-1]}")
+
+        text_tokens = text_padding_mask = has_text = None
+        if notes_input is not None:
+            if tau is None:
+                raise ValueError("tau is required when notes_input is provided")
+            if self.text_event_encoder is None or len(self.text_injections) == 0:
+                raise RuntimeError(
+                    "MTGNN native text fusion was not configured. Instantiate "
+                    "GPINet with enable_text=True and use_text_embeddings=True."
+                )
+            text_tokens, text_padding_mask, has_text = self.text_event_encoder(
+                notes_input, tau
+            )
+
         adjacency = self.graph()
         h = self.start(x)
-        for block in self.blocks:
+        gate_means = []
+        attention_entropies = []
+        for layer_idx, block in enumerate(self.blocks):
             residual = h
             h = torch.tanh(block["temporal"](h))
+
+            # Text enters the MTGNN representation between temporal feature
+            # extraction and graph propagation. K report events stay K events;
+            # the returned message is variable-specific, not a 24-point text
+            # pseudo-series.
+            if text_tokens is not None:
+                h, attn_weights, gate = self.text_injections[layer_idx](
+                    h, text_tokens, text_padding_mask, has_text
+                )
+                valid_rows = has_text.view(-1, 1, 1)
+                if valid_rows.any():
+                    gate_means.append(gate[valid_rows.expand_as(gate)].mean())
+                    probs = attn_weights.clamp_min(1e-8)
+                    entropy = -(probs * probs.log()).sum(dim=-1)
+                    attention_entropies.append(entropy[has_text].mean())
+
             h = block["graph"](h, adjacency)
             h = block["norm"](h + residual)
+
+        self.last_text_gate_mean = (
+            torch.stack(gate_means).mean().detach() if gate_means else None
+        )
+        self.last_text_attention_entropy = (
+            torch.stack(attention_entropies).mean().detach()
+            if attention_entropies
+            else None
+        )
         h = self.dropout(F.relu(h))  # (B, hidden, N, T)
         b, hd, n, t = h.shape
         h = h.permute(0, 2, 1, 3).reshape(b, n, hd * t)
@@ -440,16 +518,11 @@ class LearnableTE(nn.Module):
 
 
 class GPINet(nn.Module):
-    """GP interpolation -> Gauss-Hermite fusion -> [optional native text
-    merge] -> MTGNN encoder -> per-query decoder.
+    """GP interpolation -> MTGNN internal text fusion -> query decoder.
 
-    By default (forecasting() called without notes_input/tau) this is
-    numeric-only and behaves exactly as before; text fusion happens
-    externally via fusions/FusionModel.py, same as every other model in
-    this repo. If forecasting() is called WITH notes_input/tau (currently
-    only done by lib/evaluation.py for GPINet specifically), text is pooled
-    onto the GP's history-side query grid and merged into `fused` before
-    self.backbone() instead -- see module docstring and GPTextPooler.
+    `notes_input=None` selects the unchanged numerical path. Supplying report
+    embeddings and their raw timestamps keeps the reports as K independent
+    events and lets MTGNN variable nodes attend to them inside its blocks.
     """
 
     def __init__(self, args, supports=None, dropout=0):
@@ -504,53 +577,31 @@ class GPINet(nn.Module):
         self.last_mll = None
         self.last_valid_pairs = None
 
-        # --- Optional native text fusion (see class/module docstring) ---
-        # Constructed LAST, after every numeric-path submodule above, so
-        # that Uni-modal (notes_input=None) runs draw the exact same RNG
-        # sequence for gp/fusion/backbone/te/decoder init as before this
-        # feature existed, so those layers' INITIAL WEIGHTS are unchanged.
-        # NOTE (corrected 2026-08-09): this does NOT make Uni-modal results
-        # bit-for-bit reproducible overall, as originally assumed -- set_seed()
-        # is only called once at process start, and constructing these extra
-        # parameters (even last, even unused for Uni) still consumes RNG
-        # draws, shifting the global RNG cursor for everything that runs
-        # afterward (dataloader shuffling, every dropout call during
-        # training). Confirmed empirically: Uni mse moved from 0.7676 to
-        # 0.7544 after this feature was added, despite notes_input=None
-        # taking the byte-identical old code path. Not a correctness bug --
-        # the numeric forward graph is unchanged when notes_input is None --
-        # just a reproducibility side effect of shared global RNG state. If
-        # exact Uni reproducibility matters later, gate construction of
-        # text_pooler/text_merge behind `getattr(args, "enable_text", False)`
-        # instead of always building them.
-        # Always constructed (even for Uni-only runs) for simplicity; if
-        # forecasting() is never called with notes_input, these parameters
-        # just sit unused/untrained, which is harmless but slightly
-        # wasteful -- fine for now, can gate behind args later if it matters.
-        self.total_window = float(args.history + args.pred_window)
-        # NOTE: notes_input (batch_dict["notes_embeddings"]) is the RAW
-        # embedding saved by compute_text_embeddings.py -- its last-dim size
-        # is whatever --llm_model_fusion's native hidden size is (e.g. 768
-        # for GPT2 *and* for BERT-base -- both happen to be 768-dim, see
-        # fusions/load_llm.py's _ALIAS comments). args.d_txt is really "the
-        # dimension fusions/TTF_*.py project raw embeddings TO" (see
-        # fusions/TTF_T2V_XAttn.py's input_proj), not necessarily the raw
-        # size -- it only coincides with the raw size for GPT2/BERT because
-        # d_txt's default (768) happens to match both. If --llm_model_fusion
-        # ever changes to Llama/DeepSeek (4096-dim) while --d_txt stays at
-        # its default, self.text_pooler.proj_in below will raise a shape-
-        # mismatch RuntimeError on the first forward call (loud failure, not
-        # silently wrong -- acceptable, but flagging so it's not a surprise).
-        d_txt_in = int(getattr(args, "d_txt", 768))
-        self.text_pooler = GPTextPooler(
-            d_txt_in=d_txt_in,
-            hid_dim=self.hid_dim,
-            total_window=self.total_window,
-            n_query=n_query,
-            n_heads=int(getattr(args, "n_heads_fusion", 1)),
-            dropout=float(args.dropout),
+        # Configure native text modules only for the multimodal/precomputed
+        # route. Construction happens after every numerical module and inside
+        # a forked RNG context: numeric weights and the caller's RNG stream are
+        # therefore unchanged relative to a Uni model initialized with the
+        # same seed.
+        self.native_text_enabled = bool(
+            getattr(args, "enable_text", False)
+            and getattr(args, "use_text_embeddings", False)
         )
-        self.text_merge = GPTextGatedMerge(self.hid_dim)
+        if self.native_text_enabled:
+            text_seed = int(getattr(args, "seed", 0)) + 104729
+            with torch.random.fork_rng(devices=[], enabled=True):
+                torch.manual_seed(text_seed)
+                self.backbone.configure_text_fusion(
+                    d_txt_in=int(getattr(args, "d_txt", 768)),
+                    history_window=float(args.history),
+                    n_heads=int(getattr(args, "n_heads_fusion", 1)),
+                    dropout=float(args.dropout),
+                    gate_bias=float(
+                        getattr(args, "gpinet_text_gate_bias", -1.0)
+                    ),
+                )
+
+        self.last_text_gate_mean = None
+        self.last_text_attention_entropy = None
 
     def get_hyperparams(self):
         return self.gp.get_hyperparams()
@@ -569,10 +620,8 @@ class GPINet(nn.Module):
         X (observed_data):     (B, T_obs, N)
         truth_time_steps:      (B, T_obs)     shared time axis across variables
         mask (observed_mask):  (B, T_obs, N)
-        notes_input: optional (B, N_max, d_txt) precomputed note embeddings.
-            When None (default), this is the original numeric-only path,
-            identical to before this feature existed. When provided (along
-            with tau), text is merged into `fused` before self.backbone().
+        notes_input: optional (B, K_max, d_txt) precomputed report embeddings.
+            Reports remain K independent events inside the MTGNN backbone.
         tau: optional (B, N_max) RAW (unnormalized) note timestamps,
             required if notes_input is provided.
         returns:                (B, Lp, N)
@@ -594,27 +643,22 @@ class GPINet(nn.Module):
         gp_input = F.pad(gp_input, (1, 0, 0, 0))  # (B, 2, N, Q+1)
         fused = self.fusion(gp_input[:, 0:1], gp_input[:, 1:2])  # (B, hid_dim, N, Q+1)
 
-        if notes_input is not None:
-            if tau is None:
-                raise ValueError("tau is required when notes_input is provided")
-            # Pool text onto the *history-side* query grid t_query (Q points,
-            # no padding column yet), then pad the same way gp_input was
-            # padded (a leading zero column) so the two line up at Q+1.
-            text_pooled, has_text = self.text_pooler(
-                notes_input, tau, self.gp.t_query
-            )  # (B, hid_dim, Q), (B,)
-            text_pooled = F.pad(text_pooled, (1, 0))  # (B, hid_dim, Q+1)
-            # Belt-and-suspenders zeroing for no-note samples: GPTextGatedMerge
-            # already forces g=1 (exact no-op) for these via has_text_mask, so
-            # this pre-zeroing isn't load-bearing for correctness anymore, but
-            # keeps the values the gate module sees clean/predictable too.
-            has_text_mask = has_text.view(B, 1, 1, 1).to(text_pooled.dtype)
-            text_pooled = text_pooled.unsqueeze(2).expand(-1, -1, N, -1)  # (B, hid_dim, N, Q+1)
-            text_pooled = text_pooled * has_text_mask
+        if notes_input is not None and not self.native_text_enabled:
+            raise RuntimeError(
+                "notes_input was supplied but native text fusion is disabled. "
+                "Instantiate GPINet with enable_text=True and "
+                "use_text_embeddings=True."
+            )
 
-            fused = self.text_merge(fused, text_pooled, has_text_mask)
-
-        h = self.backbone(fused)  # (B, N, hid_dim)
+        h = self.backbone(
+            fused,
+            notes_input=notes_input,
+            tau=tau,
+        )  # (B, N, hid_dim)
+        self.last_text_gate_mean = self.backbone.last_text_gate_mean
+        self.last_text_attention_entropy = (
+            self.backbone.last_text_attention_entropy
+        )
 
         Lp = time_steps_to_predict.shape[1]
         h_exp = h.unsqueeze(2).expand(B, N, Lp, self.hid_dim)

@@ -9,10 +9,14 @@ set -euo pipefail
 
 TRAIN_N=1000
 ENABLE_TEXT=0
+SWEEP=0
+SWEEP_SIZES_CSV="1000,2000,4000"
+SWEEP_MODES="both"
+OUTPUT_DIR=""
 GPU=0
-EPOCHS=20
+EPOCHS=50
 BATCH_SIZE=32
-PATIENCE=5
+PATIENCE=10
 MODEL_SEED=1
 LOADER_SEED=314159
 
@@ -33,30 +37,45 @@ NODE_DIM=10
 HID_DIM=64
 DROPOUT=0.3
 
-TTF_MODULE="TTF_T2V_XAttn"
-MMF_MODULE="MMF_XAttn_Add"
+TEXT_HEADS=1
+TEXT_GATE_BIAS=-1.0
 
 usage() {
 cat <<'EOF'
 Usage:
   ./scripts/run_gpinet_fixed.sh -n TRAIN_N [options]
+  ./scripts/run_gpinet_fixed.sh --sweep [options]
 
 Options:
   -n, --num N           Number of TRAIN subjects (default: 1000)
   --text                Enable BERT/radiology multimodal run
-  --epochs N            Epochs (default: 20)
+  --sweep               Run the fixed 1000/2000/4000 Uni+Multi experiment set
+  --sizes CSV           Sweep sizes (default: 1000,2000,4000)
+  --modes MODE          Sweep modes: both, uni, or text (default: both)
+  --output-dir DIR      Sweep log directory (default: timestamped directory)
+  --epochs N            Epochs (default: 50)
   --batch-size N        Batch size (default: 32)
   --patience N          Early stopping patience (default: 5)
   --gpu ID              GPU id for main.py (default: 0)
   --seed N              Model/training seed (default: 1)
   --loader-seed N       Fixed DataLoader shuffle seed (default: 314159)
+  --text-heads N        Heads for MTGNN variable-to-report attention (default: 1)
+  --text-gate-bias X    Initial internal text-gate bias (default: -1.0)
   -h, --help            Show this help
 
 Examples:
-  ./scripts/run_gpinet_fixed.sh -n 200
-  ./scripts/run_gpinet_fixed.sh -n 200 --text
+  ./scripts/run_gpinet_fixed.sh -n 1000
+  ./scripts/run_gpinet_fixed.sh -n 1000 --text
+  ./scripts/run_gpinet_fixed.sh --sweep
+  ./scripts/run_gpinet_fixed.sh --sweep --epochs 50 --patience 10
+  ./scripts/run_gpinet_fixed.sh --sweep --modes text --sizes 1000,2000,4000
   ./scripts/run_gpinet_fixed.sh -n 1000 --epochs 50 --patience 10
   ./scripts/run_gpinet_fixed.sh -n 1000 --text --epochs 50 --patience 10
+
+Sweep outputs:
+  <output-dir>/final_metrics.log                  readable MSE/MAE summary
+  <output-dir>/final_metrics.csv                  machine-readable summary
+  <output-dir>/gpinet_n<N>_<uni|text>_seed<S>.log full console log per run
 
 Protocol file (created once):
   data/MIMIC/mimic_fixed_protocol.json
@@ -74,18 +93,24 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -n|--num) TRAIN_N="$2"; shift 2 ;;
         --text) ENABLE_TEXT=1; shift ;;
+        --sweep) SWEEP=1; shift ;;
+        --sizes) SWEEP_SIZES_CSV="$2"; shift 2 ;;
+        --modes) SWEEP_MODES="$2"; shift 2 ;;
+        --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
         --epochs) EPOCHS="$2"; shift 2 ;;
         --batch-size) BATCH_SIZE="$2"; shift 2 ;;
         --patience) PATIENCE="$2"; shift 2 ;;
         --gpu) GPU="$2"; shift 2 ;;
         --seed) MODEL_SEED="$2"; shift 2 ;;
         --loader-seed) LOADER_SEED="$2"; shift 2 ;;
+        --text-heads) TEXT_HEADS="$2"; shift 2 ;;
+        --text-gate-bias) TEXT_GATE_BIAS="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; usage >&2; exit 1 ;;
     esac
 done
 
-for pair in "TRAIN_N:$TRAIN_N" "EPOCHS:$EPOCHS" "BATCH_SIZE:$BATCH_SIZE" "PATIENCE:$PATIENCE"; do
+for pair in "TRAIN_N:$TRAIN_N" "EPOCHS:$EPOCHS" "BATCH_SIZE:$BATCH_SIZE" "PATIENCE:$PATIENCE" "TEXT_HEADS:$TEXT_HEADS"; do
     name="${pair%%:*}"; value="${pair#*:}"
     if ! [[ "$value" =~ ^[0-9]+$ ]] || [[ "$value" -le 0 ]]; then
         echo "Error: $name must be a positive integer, got $value" >&2
@@ -96,6 +121,140 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
+
+if [[ "$SWEEP" -eq 1 ]]; then
+    case "$SWEEP_MODES" in
+        both) SWEEP_TEXT_FLAGS=(0 1) ;;
+        uni)  SWEEP_TEXT_FLAGS=(0) ;;
+        text) SWEEP_TEXT_FLAGS=(1) ;;
+        *)
+            echo "Error: --modes must be one of: both, uni, text" >&2
+            exit 2
+            ;;
+    esac
+
+    IFS=',' read -r -a SWEEP_SIZES <<< "$SWEEP_SIZES_CSV"
+    if [[ "${#SWEEP_SIZES[@]}" -eq 0 ]]; then
+        echo "Error: --sizes must contain at least one positive integer" >&2
+        exit 2
+    fi
+    for size in "${SWEEP_SIZES[@]}"; do
+        if ! [[ "$size" =~ ^[0-9]+$ ]] || [[ "$size" -le 0 ]]; then
+            echo "Error: invalid train size in --sizes: $size" >&2
+            exit 2
+        fi
+    done
+
+    if [[ -z "$OUTPUT_DIR" ]]; then
+        OUTPUT_DIR="$REPO_ROOT/logs/gpinet_fixed_sweep/$(date '+%Y%m%d_%H%M%S')"
+    elif [[ "$OUTPUT_DIR" != /* ]]; then
+        OUTPUT_DIR="$REPO_ROOT/$OUTPUT_DIR"
+    fi
+    mkdir -p "$OUTPUT_DIR"
+
+    RESULTS_LOG="$OUTPUT_DIR/final_metrics.log"
+    RESULTS_CSV="$OUTPUT_DIR/final_metrics.csv"
+    SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+
+    {
+        echo "GPINet fixed-protocol sweep"
+        echo "started_at       : $(date '+%Y-%m-%d %H:%M:%S %z')"
+        echo "train_sizes      : $SWEEP_SIZES_CSV"
+        echo "modes            : $SWEEP_MODES"
+        echo "model_seed       : $MODEL_SEED"
+        echo "loader_seed      : $LOADER_SEED"
+        echo "epochs/patience  : $EPOCHS/$PATIENCE"
+        echo "batch_size       : $BATCH_SIZE"
+        echo "output_directory : $OUTPUT_DIR"
+        echo
+        printf '%-10s %-10s %-18s %-18s %-10s\n' \
+            "train_n" "mode" "mse" "mae" "status"
+    } > "$RESULTS_LOG"
+
+    echo "train_n,mode,text_enabled,model_seed,loader_seed,mse,mae,status,run_log" \
+        > "$RESULTS_CSV"
+
+    FAILED_RUNS=0
+    TOTAL_RUNS=0
+    for size in "${SWEEP_SIZES[@]}"; do
+        for text_flag in "${SWEEP_TEXT_FLAGS[@]}"; do
+            TOTAL_RUNS=$((TOTAL_RUNS + 1))
+            mode="uni"
+            if [[ "$text_flag" -eq 1 ]]; then
+                mode="text"
+            fi
+
+            RUN_LOG="$OUTPUT_DIR/gpinet_n${size}_${mode}_seed${MODEL_SEED}.log"
+            RUN_CMD=(
+                "$SCRIPT_PATH"
+                -n "$size"
+                --epochs "$EPOCHS"
+                --batch-size "$BATCH_SIZE"
+                --patience "$PATIENCE"
+                --gpu "$GPU"
+                --seed "$MODEL_SEED"
+                --loader-seed "$LOADER_SEED"
+                --text-heads "$TEXT_HEADS"
+                --text-gate-bias "$TEXT_GATE_BIAS"
+            )
+            if [[ "$text_flag" -eq 1 ]]; then
+                RUN_CMD+=(--text)
+            fi
+
+            echo
+            echo "##################################################################"
+            echo "### Sweep run $TOTAL_RUNS: train_n=$size mode=$mode"
+            echo "### Full log: $RUN_LOG"
+            echo "##################################################################"
+
+            set +e
+            "${RUN_CMD[@]}" 2>&1 | tee "$RUN_LOG"
+            RUN_STATUS=${PIPESTATUS[0]}
+            set -e
+
+            MSE="$(
+                tr '\r' '\n' < "$RUN_LOG" \
+                    | awk -F': ' '$1 == "mse" {value=$2} END {print value}'
+            )"
+            MAE="$(
+                tr '\r' '\n' < "$RUN_LOG" \
+                    | awk -F': ' '$1 == "mae" {value=$2} END {print value}'
+            )"
+
+            status="ok"
+            if [[ "$RUN_STATUS" -ne 0 || -z "$MSE" || -z "$MAE" ]]; then
+                status="failed"
+                FAILED_RUNS=$((FAILED_RUNS + 1))
+                [[ -n "$MSE" ]] || MSE="NA"
+                [[ -n "$MAE" ]] || MAE="NA"
+            fi
+
+            printf '%-10s %-10s %-18s %-18s %-10s\n' \
+                "$size" "$mode" "$MSE" "$MAE" "$status" \
+                | tee -a "$RESULTS_LOG"
+            printf '%s,%s,%s,%s,%s,%s,%s,%s,"%s"\n' \
+                "$size" "$mode" "$text_flag" "$MODEL_SEED" \
+                "$LOADER_SEED" "$MSE" "$MAE" "$status" "$RUN_LOG" \
+                >> "$RESULTS_CSV"
+        done
+    done
+
+    {
+        echo
+        echo "finished_at : $(date '+%Y-%m-%d %H:%M:%S %z')"
+        echo "total_runs  : $TOTAL_RUNS"
+        echo "failed_runs : $FAILED_RUNS"
+    } | tee -a "$RESULTS_LOG"
+
+    echo
+    echo "### Sweep complete"
+    echo "### Final MSE/MAE log: $RESULTS_LOG"
+    echo "### CSV summary      : $RESULTS_CSV"
+    if [[ "$FAILED_RUNS" -ne 0 ]]; then
+        exit 1
+    fi
+    exit 0
+fi
 
 PROTOCOL="data/MIMIC/mimic_fixed_protocol.json"
 if [[ ! -f "$PROTOCOL" ]]; then
@@ -164,6 +323,10 @@ echo "loader seed           : $LOADER_SEED"
 echo "epochs / patience     : $EPOCHS / $PATIENCE"
 echo "batch size            : $BATCH_SIZE"
 echo "normalization         : current Train_N HISTORY only"
+if [[ "$ENABLE_TEXT" -eq 1 ]]; then
+    echo "text fusion           : variable-to-report attention inside MTGNN"
+    echo "text heads / gate bias: $TEXT_HEADS / $TEXT_GATE_BIAS"
+fi
 echo "=================================================================="
 
 if [[ "$ENABLE_TEXT" -eq 1 ]]; then
@@ -251,8 +414,8 @@ if [[ "$ENABLE_TEXT" -eq 1 ]]; then
         --llm_model_fusion "$LLM_MODEL"
         --llm_layers_fusion "$LLM_LAYERS"
         --max_length "$MAX_LENGTH"
-        --TTF_module "$TTF_MODULE"
-        --MMF_module "$MMF_MODULE"
+        --n_heads_fusion "$TEXT_HEADS"
+        --gpinet_text_gate_bias "$TEXT_GATE_BIAS"
     )
 fi
 
