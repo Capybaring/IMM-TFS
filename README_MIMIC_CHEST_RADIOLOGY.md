@@ -33,9 +33,11 @@ data/mimic-iv-note/2.2/note/
 
 ## Numeric variables
 
-The output has 24 continuous numeric channels.
+The output has exactly 16 continuous numeric channels. Every channel is present
+in both the 0-24 h history and the 24-48 h target window and receives forecasting
+supervision.
 
-### Forecast targets (16)
+### Forecast variables (16)
 
 ```text
 spo2
@@ -56,23 +58,11 @@ tidal_volume_observed
 wbc
 ```
 
-### History-only treatment/device covariates (8)
-
-```text
-fio2
-oxygen_flow
-peep
-tidal_volume_set
-pressure_support
-peak_inspiratory_pressure
-plateau_pressure
-mean_airway_pressure
-```
-
-The eight history covariates are retained before hour 24 but deliberately have
-no target observations after hour 24. The existing masked loss therefore
-evaluates only the 16 physiologic targets while MTGNN can still learn from the
-respiratory treatment/device history.
+The previous eight history-only treatment/device covariates (`fio2`,
+`oxygen_flow`, `peep`, `tidal_volume_set`, `pressure_support`,
+`peak_inspiratory_pressure`, `plateau_pressure`, and `mean_airway_pressure`)
+are deliberately excluded. Therefore GPINet/MTGNN has 16 graph nodes and every
+node is trained and evaluated as a forecast target.
 
 ## Text selection
 
@@ -178,10 +168,10 @@ python -u scripts/prepare_mimic_chest_radiology.py \
   --overwrite
 ```
 
-The feature schema changes from the TIME-IMM variables to 24 chest-task
+The feature schema changes from the TIME-IMM variables to 16 chest-task
 variables, so the old fixed protocol and old text embeddings must not be
 reused. `--overwrite` removes the generated `processed*` folders and stale
-`mimic_fixed_protocol.json` only inside the selected output root. Rebuild it:
+fixed protocol/scaler only inside the selected output root. Rebuild them:
 
 ```bash
 python -u scripts/prepare_mimic_fixed_protocol.py \
@@ -206,4 +196,3 @@ Then the existing experiment command remains:
 2. `sample_statistics.csv`: numeric/text coverage and filtering outcome per stay.
 3. `text_event_metadata.csv`: exam type, RR/AR, charttime, storetime and parent link.
 4. `tfsimm_dataset_config.json`: full reproducibility configuration and source counts.
-

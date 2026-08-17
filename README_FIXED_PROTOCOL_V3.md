@@ -1,4 +1,4 @@
-# Expanded MIMIC fixed/nested scaling protocol (v3)
+# Expanded MIMIC fixed/nested scaling protocol (v4)
 
 This package is for the **formal patient-scaling experiment**. It does not replace the existing smoke-test workflow.
 
@@ -101,6 +101,6 @@ Those use the earlier subset-and-resplit behavior and are only for debugging, no
 
 ## Important interpretation
 
-Under this v3 formal protocol, absolute MSE/MAE across different N are evaluated on the same fixed test subjects and the same normalization scale. Therefore the N-scaling curve is directly interpretable.
+Under this v4 formal protocol, absolute MSE/MAE across different N are evaluated on the same fixed test subjects and the same normalization scale. Therefore the N-scaling curve is directly interpretable.
 
 For each N, Uni and Multi also use the exact same train subjects, validation subjects, test subjects, normalization and minibatch ordering. The textual modality is the intended major difference.

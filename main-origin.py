@@ -1023,15 +1023,17 @@ def trainable(
     args.input_len, args.pred_len = get_input_and_pred_len(data_obj)
     model_class = globals()[args.model]
     model = model_class(args).to(args.device)
-
-    # IMM-TFS-style multimodal routing:
-    # GPINet-origin is a numeric-only forecasting backbone. When text is
-    # enabled, the generic FusionModel consumes the timestamped text inputs
-    # and fuses them with GPINet's numerical predictions after forecasting,
-    # exactly like the other IMM-TFS benchmark backbones.
+    use_native_gpinet_text = bool(
+        args.enable_text
+        and args.model == "GPINet"
+        and args.use_text_embeddings
+    )
+    # GPINet consumes report events inside its MTGNN backbone. Constructing a
+    # second generic output-level FusionModel would add unused parameters to
+    # the optimizer and make the configured TTF/MMF flags misleading.
     fusion = (
         FusionModel(args).to(args.device)
-        if args.enable_text
+        if args.enable_text and not use_native_gpinet_text
         else None
     )
 

@@ -77,15 +77,16 @@ Sweep outputs:
   <output-dir>/final_metrics.csv                  machine-readable summary
   <output-dir>/gpinet_n<N>_<uni|text>_seed<S>.log full console log per run
 
-Protocol file (created once):
+Protocol files (created once):
   data/MIMIC/mimic_fixed_protocol.json
+  data/MIMIC/mimic_fixed_normalization.pt
 
 If missing, this runner creates it automatically using:
   split_seed       = 42
   train_order_seed = 2026
 
-Normalization is NOT persisted globally. For every N, the loader fits:
-  scaler_N = Train_N HISTORY [0,24h) only
+Normalization is persisted once and shared by every N, Uni, and Text run:
+  scaler = FULL fixed TRAIN HISTORY [0,24h) only
 EOF
 }
 
@@ -257,7 +258,8 @@ if [[ "$SWEEP" -eq 1 ]]; then
 fi
 
 PROTOCOL="data/MIMIC/mimic_fixed_protocol.json"
-if [[ ! -f "$PROTOCOL" ]]; then
+NORMALIZATION="data/MIMIC/mimic_fixed_normalization.pt"
+if [[ ! -f "$PROTOCOL" && ! -f "$NORMALIZATION" ]]; then
     echo "### Fixed protocol not found; preparing it once from the full cohort ###"
     python scripts/prepare_mimic_fixed_protocol.py \
         --dataset-dir data/MIMIC \
@@ -266,6 +268,10 @@ if [[ ! -f "$PROTOCOL" ]]; then
         --time-unit "$TIME_UNIT" \
         --split-seed 42 \
         --train-order-seed 2026
+elif [[ ! -f "$PROTOCOL" || ! -f "$NORMALIZATION" ]]; then
+    echo "### Fixed protocol/scaler is incomplete; rebuild both once with:" >&2
+    echo "python scripts/prepare_mimic_fixed_protocol.py --force" >&2
+    exit 2
 else
     PROTOCOL_VERSION="$(python - "$PROTOCOL" <<'PY'
 import json, sys
@@ -273,8 +279,8 @@ with open(sys.argv[1], encoding="utf-8") as f:
     print(json.load(f).get("version", ""))
 PY
 )"
-    if [[ "$PROTOCOL_VERSION" != "3-per-n-normalization" ]]; then
-        echo "### Existing fixed protocol is from the older full-train-normalization v3." >&2
+    if [[ "$PROTOCOL_VERSION" != "4-fixed-full-train-normalization" ]]; then
+        echo "### Existing fixed protocol uses an incompatible normalization rule." >&2
         echo "### Rebuild once with:" >&2
         echo "python scripts/prepare_mimic_fixed_protocol.py --force" >&2
         exit 2
@@ -322,7 +328,7 @@ echo "model seed            : $MODEL_SEED"
 echo "loader seed           : $LOADER_SEED"
 echo "epochs / patience     : $EPOCHS / $PATIENCE"
 echo "batch size            : $BATCH_SIZE"
-echo "normalization         : current Train_N HISTORY only"
+echo "normalization         : fixed FULL-TRAIN HISTORY"
 if [[ "$ENABLE_TEXT" -eq 1 ]]; then
     echo "text fusion           : variable-to-report attention inside MTGNN"
     echo "text heads / gate bias: $TEXT_HEADS / $TEXT_GATE_BIAS"
@@ -383,6 +389,7 @@ fi
 
 export MIMIC_FIXED_PROTOCOL=1
 export MIMIC_PROTOCOL_PATH="$REPO_ROOT/$PROTOCOL"
+export MIMIC_NORMALIZATION_PATH="$REPO_ROOT/$NORMALIZATION"
 export MIMIC_LOADER_SEED="$LOADER_SEED"
 
 CMD=(

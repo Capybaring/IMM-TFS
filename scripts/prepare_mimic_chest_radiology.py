@@ -25,11 +25,11 @@ Core design:
   strictly with storetime;
 * RR and AR remain separate timestamped text events. AR inherits the parent
   exam metadata when necessary;
-* history-only treatment/device variables have no target observations after
-  24 h, so the existing masked loss evaluates the 16 physiologic targets only.
+* the numeric schema contains only the 16 variables that are observed in both
+  history and prediction windows and receive forecasting supervision.
 
 The item IDs and cleaning rules follow the public MIT-LCP MIMIC code concepts
-for vital signs, ventilator settings, oxygen delivery, blood gases, and CBC.
+for vital signs, respiratory measurements, blood gases, and CBC.
 """
 
 from __future__ import annotations
@@ -68,18 +68,7 @@ PREDICTION_FEATURES = (
     "wbc",
 )
 
-HISTORY_ONLY_FEATURES = (
-    "fio2",
-    "oxygen_flow",
-    "peep",
-    "tidal_volume_set",
-    "pressure_support",
-    "peak_inspiratory_pressure",
-    "plateau_pressure",
-    "mean_airway_pressure",
-)
-
-FEATURES = PREDICTION_FEATURES + HISTORY_ONLY_FEATURES
+FEATURES = PREDICTION_FEATURES
 
 DIRECT_RESPIRATORY_FEATURES = {
     "spo2",
@@ -116,14 +105,6 @@ FEATURE_SPECS = (
     FeatureSpec("spo2", "chartevents", (220277,), "target", "%", 0, 100, "Peripheral oxygen saturation"),
     FeatureSpec("minute_ventilation", "chartevents", (224687,), "target", "L/min", 0, 100, "Minute ventilation"),
     FeatureSpec("tidal_volume_observed", "chartevents", (224685,), "target", "mL", 0, 3000, "Observed tidal volume"),
-    FeatureSpec("fio2", "chartevents", (223835,), "history_covariate", "%", 20, 100, "Inspired oxygen fraction"),
-    FeatureSpec("oxygen_flow", "chartevents", (223834, 227582), "history_covariate", "L/min", 0, 100, "Oxygen/BiPAP oxygen flow"),
-    FeatureSpec("peep", "chartevents", (220339, 224700), "history_covariate", "cmH2O", 0, 100, "Positive end-expiratory pressure"),
-    FeatureSpec("tidal_volume_set", "chartevents", (224684,), "history_covariate", "mL", 0, 3000, "Set tidal volume"),
-    FeatureSpec("pressure_support", "chartevents", (224701,), "history_covariate", "cmH2O", 0, 100, "Pressure support / PSV level"),
-    FeatureSpec("peak_inspiratory_pressure", "chartevents", (224695,), "history_covariate", "cmH2O", 0, 100, "Peak inspiratory pressure"),
-    FeatureSpec("plateau_pressure", "chartevents", (224696,), "history_covariate", "cmH2O", 0, 100, "Plateau pressure"),
-    FeatureSpec("mean_airway_pressure", "chartevents", (224697,), "history_covariate", "cmH2O", 0, 100, "Mean airway pressure"),
     FeatureSpec("ph", "labevents", (50820,), "target", "pH", 6.0, 8.5, "Blood gas pH"),
     FeatureSpec("pao2", "labevents", (50821,), "target", "mmHg", 0, 1000, "Blood gas oxygen partial pressure"),
     FeatureSpec("paco2", "labevents", (50818,), "target", "mmHg", 0, 300, "Blood gas carbon dioxide partial pressure"),
@@ -270,6 +251,7 @@ def _prepare_output_root(output_root: Path, overwrite: bool) -> None:
         output_root / "text_event_metadata.csv",
         output_root / "tfsimm_dataset_config.json",
         output_root / "mimic_fixed_protocol.json",
+        output_root / "mimic_fixed_normalization.pt",
     ]
     existing = [path for path in generated_dirs + generated_files if path.exists()]
     if existing and not overwrite:
@@ -313,12 +295,6 @@ def _clean_feature_values(frame: pd.DataFrame) -> pd.DataFrame:
 
     fahrenheit = frame["itemid"].eq(223761)
     frame.loc[fahrenheit, "value"] = (frame.loc[fahrenheit, "value"] - 32.0) / 1.8
-
-    fio2 = frame["feature"].eq("fio2")
-    fio2_fraction = fio2 & frame["value"].between(0.20, 1.0, inclusive="both")
-    frame.loc[fio2_fraction, "value"] *= 100.0
-    invalid_fio2 = fio2 & ~frame["value"].between(20.0, 100.0, inclusive="both")
-    frame.loc[invalid_fio2, "value"] = np.nan
 
     for feature, spec in SPEC_BY_FEATURE.items():
         selected = frame["feature"].eq(feature)
@@ -399,9 +375,6 @@ def load_chartevents(
         chunk, missing = _availability_filter(chunk, args.context_hours)
         missing_storetime += missing
 
-        # Treatment/device variables are history covariates, not forecast labels.
-        history_only = chunk["feature"].isin(HISTORY_ONLY_FEATURES)
-        chunk = chunk[(~history_only) | (chunk["rel_hours"] < args.context_hours)]
         chunk = _clean_feature_values(chunk)
         if not chunk.empty:
             pieces.append(
@@ -935,7 +908,7 @@ def write_metadata(
     feature_dictionary.to_csv(args.output_root / "feature_dictionary.csv", index=False)
 
     config = {
-        "version": "mimic-chest-radiology-v1",
+        "version": "mimic-chest-radiology-v2-targets-only",
         "context_hours": args.context_hours,
         "prediction_hours": args.prediction_hours,
         "one_episode_per_patient": True,
@@ -953,7 +926,6 @@ def write_metadata(
         "addendum_policy": "separate timestamped event; inherit parent exam metadata",
         "feature_names": list(FEATURES),
         "prediction_features": list(PREDICTION_FEATURES),
-        "history_only_features": list(HISTORY_ONLY_FEATURES),
         "quality_filters": {
             "min_history_observations": args.min_history_observations,
             "min_target_observations": args.min_target_observations,

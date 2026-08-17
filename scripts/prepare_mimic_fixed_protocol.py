@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Prepare the fixed/nested expanded-MIMIC scaling protocol (v3 per-N norm).
+"""Prepare the fixed/nested expanded-MIMIC scaling protocol (v4 fixed norm).
 
-This script creates ONE persisted subject split and ONE persisted randomized
-training-subject order. It intentionally DOES NOT fit normalization.
+This script creates ONE persisted subject split, ONE persisted randomized
+training-subject order, and ONE persisted normalization shared by every run.
 
 Formal protocol
 ---------------
@@ -11,11 +11,14 @@ Formal protocol
 3. Train_N subsets are nested prefixes:
        T200 ⊂ T500 ⊂ T1000 ⊂ ...
 4. Validation and test subjects never change with N.
-5. At run time, each Train_N fits its own feature-wise z-score using ONLY
-   observed numeric values from that Train_N's HISTORY [0,24h).
+5. Fit one feature-wise z-score using ONLY observed numeric values from the
+   FULL fixed training pool's HISTORY [0,24h).
+6. Reuse that exact scaler for every Train_N, Uni, and Text run so metrics from
+   the fixed validation/test patients remain on one directly comparable scale.
 
 Output:
   data/MIMIC/mimic_fixed_protocol.json
+  data/MIMIC/mimic_fixed_normalization.pt
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
 from sklearn.model_selection import train_test_split
 
 
@@ -49,6 +53,9 @@ def parse_args():
     p.add_argument("--split-seed", type=int, default=42)
     p.add_argument("--train-order-seed", type=int, default=2026)
     p.add_argument("--protocol-name", default="mimic_fixed_protocol.json")
+    p.add_argument(
+        "--normalization-name", default="mimic_fixed_normalization.pt"
+    )
     p.add_argument("--force", action="store_true")
     return p.parse_args()
 
@@ -93,14 +100,16 @@ def main():
     dataset_dir = Path(args.dataset_dir).resolve()
     proc_dir = dataset_dir / "processed"
     protocol_path = dataset_dir / args.protocol_name
+    norm_path = dataset_dir / args.normalization_name
 
     if not proc_dir.is_dir():
         raise FileNotFoundError(proc_dir)
 
-    if protocol_path.exists() and not args.force:
+    if (protocol_path.exists() or norm_path.exists()) and not args.force:
         raise FileExistsError(
             "Protocol output already exists. Use --force only if you intentionally "
-            f"want to rebuild the subject split/order.\n  {protocol_path}"
+            "want to rebuild the subject split/order/scaler.\n"
+            f"  {protocol_path}\n  {norm_path}"
         )
 
     record_ids = sorted(
@@ -154,11 +163,15 @@ def main():
     val_records = flatten_records(val_subj, subject_to_records)
     test_records = flatten_records(test_subj, subject_to_records)
 
-    # We scan the episode files only to lock feature schema and padding maxima.
-    # No target values are used for normalization here; no scaler is fitted.
+    # Scan once to lock the schema/padding maxima and fit a single reference
+    # scaler. Validation/test subjects and all 24-48 h targets are excluded.
+    train_subject_set = set(train_subj)
     sec_per_unit = UNIT_SECONDS[args.time_unit]
     total_window = args.history + args.pred_window
     feature_cols: list[str] | None = None
+    count: np.ndarray | None = None
+    summ: np.ndarray | None = None
+    sumsq: np.ndarray | None = None
     global_max_history_timestamps = 0
     global_max_prediction_timestamps = 0
 
@@ -174,7 +187,7 @@ def main():
     )
     print(f"split seed           : {args.split_seed}")
     print(f"train-order seed     : {args.train_order_seed}")
-    print("normalization        : NOT fitted here; each Train_N fits HISTORY only")
+    print("normalization        : fixed FULL-TRAIN HISTORY z-score")
     print("=" * 72)
 
     for k, rec in enumerate(record_ids, start=1):
@@ -194,6 +207,9 @@ def main():
         ]
         if feature_cols is None:
             feature_cols = feats
+            count = np.zeros(len(feats), dtype=np.float64)
+            summ = np.zeros(len(feats), dtype=np.float64)
+            sumsq = np.zeros(len(feats), dtype=np.float64)
         elif feats != feature_cols:
             raise ValueError(
                 f"{rec}: feature schema/order differs from first record"
@@ -213,13 +229,66 @@ def main():
             global_max_prediction_timestamps, int(p.sum())
         )
 
+        if rec_to_subject[rec] in train_subject_set:
+            values = (
+                df[feature_cols]
+                .apply(pd.to_numeric, errors="coerce")
+                .to_numpy(dtype=np.float64)
+            )
+            history_values = values[h]
+            finite = np.isfinite(history_values)
+            safe = np.where(finite, history_values, 0.0)
+            assert count is not None and summ is not None and sumsq is not None
+            count += finite.sum(axis=0)
+            summ += safe.sum(axis=0)
+            sumsq += np.square(safe).sum(axis=0)
+
         if k % 1000 == 0 or k == len(record_ids):
             print(f"scanned {k:,}/{len(record_ids):,}")
 
-    assert feature_cols is not None
+    assert (
+        feature_cols is not None
+        and count is not None
+        and summ is not None
+        and sumsq is not None
+    )
+
+    missing = np.flatnonzero(count == 0)
+    if len(missing):
+        names = [feature_cols[i] for i in missing.tolist()]
+        raise ValueError(
+            "FULL fixed TRAIN HISTORY has zero observations for features: "
+            f"{names}"
+        )
+
+    mean = summ / count
+    # Match ExpandedMIMICDataset's sample-standard-deviation convention.
+    variance_numerator = np.maximum(sumsq - (summ * summ / count), 0.0)
+    variance_denominator = np.maximum(count - 1.0, 1.0)
+    std = np.sqrt(variance_numerator / variance_denominator)
+    bad_std = (~np.isfinite(std)) | (std < 1e-6)
+    if bad_std.any():
+        names = [feature_cols[i] for i in np.flatnonzero(bad_std).tolist()]
+        print(f"[WARN] near-constant features use std=1.0: {names}")
+        std[bad_std] = 1.0
+
+    norm_payload = {
+        "version": "4-fixed-full-train-normalization",
+        "feature_cols": feature_cols,
+        "mean": torch.tensor(mean, dtype=torch.float32),
+        "std": torch.tensor(std, dtype=torch.float32),
+        "count": torch.tensor(count, dtype=torch.long),
+        "source": "fixed full-train subjects; history observations only",
+        "history": float(args.history),
+        "pred_window": float(args.pred_window),
+        "time_unit": args.time_unit,
+        "split_seed": int(args.split_seed),
+        "train_order_seed": int(args.train_order_seed),
+    }
+    torch.save(norm_payload, norm_path)
 
     protocol = {
-        "version": "3-per-n-normalization",
+        "version": "4-fixed-full-train-normalization",
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "dataset_dir": str(dataset_dir),
         "processed_record_count": len(record_ids),
@@ -229,7 +298,10 @@ def main():
         "history": float(args.history),
         "pred_window": float(args.pred_window),
         "time_unit": args.time_unit,
-        "normalization_source": "each Train_N; history observations only",
+        "normalization_file": norm_path.name,
+        "normalization_source": (
+            "fixed full-train subjects; history observations only"
+        ),
         "feature_cols": feature_cols,
         "global_max_history_timestamps": int(global_max_history_timestamps),
         "global_max_prediction_timestamps": int(global_max_prediction_timestamps),
@@ -260,8 +332,13 @@ def main():
     print(f"max history rows     : {global_max_history_timestamps:,}")
     print(f"max prediction rows  : {global_max_prediction_timestamps:,}")
     print(f"feature count        : {len(feature_cols)}")
-    print("normalization file   : none")
-    print("normalization rule   : fit separately from each Train_N HISTORY")
+    print(f"normalization file   : {norm_path}")
+    print("normalization rule   : reuse fixed FULL-TRAIN HISTORY scaler")
+    for i in range(min(5, len(feature_cols))):
+        print(
+            f"  {feature_cols[i]}: mean={mean[i]:.6g}, "
+            f"std={std[i]:.6g}, n={int(count[i])}"
+        )
     print("=" * 72)
 
 

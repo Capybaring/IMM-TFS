@@ -1,11 +1,11 @@
 from argparse import Namespace
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 from scripts.prepare_mimic_chest_radiology import (
     _prepare_output_root,
+    PREDICTION_FEATURES,
     build_cohort,
     build_wide_numeric,
     classify_chest_exam,
@@ -97,20 +97,19 @@ def test_end_to_end_availability_and_addendum_alignment(tmp_path: Path):
         (1, 11, 111, pd.Timestamp("2020-01-01")),
         (2, 22, 222, pd.Timestamp("2020-02-01")),
     ):
-        for hour, spo2, fio2 in ((1, 95, 0.5), (25, 93, 0.6)):
-            for itemid, value in ((220277, spo2), (223835, fio2)):
-                chart_rows.append(
-                    {
-                        "subject_id": subject_id,
-                        "hadm_id": hadm_id,
-                        "stay_id": stay_id,
-                        "charttime": base + pd.Timedelta(hours=hour),
-                        "storetime": base + pd.Timedelta(hours=hour, minutes=5),
-                        "itemid": itemid,
-                        "valuenum": value,
-                        "warning": 0,
-                    }
-                )
+        for hour, spo2 in ((1, 95), (25, 93)):
+            chart_rows.append(
+                {
+                    "subject_id": subject_id,
+                    "hadm_id": hadm_id,
+                    "stay_id": stay_id,
+                    "charttime": base + pd.Timedelta(hours=hour),
+                    "storetime": base + pd.Timedelta(hours=hour, minutes=5),
+                    "itemid": 220277,
+                    "valuenum": spo2,
+                    "warning": 0,
+                }
+            )
     _write_csv(mimic_root, "icu/chartevents.csv.gz", chart_rows)
 
     lab_rows = []
@@ -231,10 +230,8 @@ def test_end_to_end_availability_and_addendum_alignment(tmp_path: Path):
     assert not (output_root / "processed" / "22").exists()
 
     time_series = pd.read_csv(output_root / "processed" / "11" / "time_series.csv")
-    times = pd.to_datetime(time_series["date_time"])
-    future = time_series[(times - times.min().normalize()).dt.total_seconds() / 3600 >= 24]
-    assert future["fio2"].isna().all()
-    assert np.isclose(time_series["fio2"].dropna().iloc[0], 50.0)
+    assert list(time_series.columns[2:]) == list(PREDICTION_FEATURES)
+    assert "fio2" not in time_series.columns
 
     # Run the repository's real loader compatibility check when the test
     # environment includes PyTorch. The lightweight preprocessing environment
@@ -265,6 +262,6 @@ def test_end_to_end_availability_and_addendum_alignment(tmp_path: Path):
         use_text_embeddings=False,
         args=loader_args,
     )
-    assert len(numeric_dataset.feature_cols) == 24
+    assert list(numeric_dataset.feature_cols) == list(PREDICTION_FEATURES)
     assert len(numeric_dataset.chunks) == 1
     assert len(text_dataset.chunks[0][-1]) == 2
