@@ -9,18 +9,11 @@ the project root (models/gpinet_mm.py), this file:
     (see models/tPatchGNN.py, models/CRU.py), so it plugs into the same
     training loop, evaluation code, and text FusionModel as every other
     baseline.
-  - keeps the original numeric-only path when text is disabled. When text is
-    enabled with precomputed embeddings, GPINet uses its native feature-level
-    path and does not invoke the repository's generic post-hoc FusionModel.
-  - optionally supports native, feature-level text fusion. Each report stays
-    an independent event token carrying its own timestamp. MTGNN variable
-    nodes query this event set *inside every temporal/graph block*; reports
-    are never resampled or spread onto the 24-point GP grid. The attended
-    text message is written into the node hidden state before graph
-    propagation, so the numerical backbone itself learns the multimodal
-    representation rather than receiving a post-hoc output correction.
-    lib/evaluation.py routes precomputed text embeddings through this path
-    specifically for GPINet when text is enabled.
+  - has NO built-in text fusion. Multimodality is handled uniformly for all
+    models by fusions/FusionModel.py, applied on top of this model's
+    numeric-only output (Y_ts) in main.py's training loop. This is required
+    to make the GPINet-vs-tPatchGNN comparison isolate the backbone as the
+    only variable.
   - queries the decoder at the batch's actual `time_steps_to_predict`
     (variable, padded, continuous) instead of a fixed internal grid, since
     IMM-TSF's standard collate does not guarantee a fixed prediction length
@@ -150,181 +143,6 @@ class GaussHermiteFusionModule(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Native text fusion. Reports remain a variable-length event set; no text
-# pseudo-sequence is created on the GP query grid.
-# ─────────────────────────────────────────────────────────────────────────
-
-
-class _GPTime2Vec(nn.Module):
-    """Compact Time2Vec used to retain each report's original event time."""
-
-    def __init__(self, d_tau: int):
-        super().__init__()
-        assert d_tau > 1, "d_tau must be > 1"
-        self.linear = nn.Linear(1, 1)
-        self.periodic = nn.Linear(1, d_tau - 1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        lin = self.linear(x)
-        per = torch.sin(self.periodic(x))
-        return torch.cat([lin, per], dim=-1)
-
-
-class TextEventEncoder(nn.Module):
-    """Encode K independent report events without inventing a time grid.
-
-    The loader supplies zero-padded report embeddings and raw timestamps in
-    hours. Padding is inferred from all-zero embeddings. A safe dummy token is
-    created only for an all-empty sample/batch so MultiheadAttention never
-    receives an all-masked key row; `has_text` later makes that path an exact
-    no-op.
-    """
-
-    def __init__(
-        self,
-        d_txt_in: int,
-        hid_dim: int,
-        history_window: float,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        self.history_window = float(history_window)
-        self.proj_in = nn.Linear(d_txt_in, hid_dim)
-        self.d_tau = max(hid_dim // 2, 2)
-        self.time2vec = _GPTime2Vec(self.d_tau)
-        self.kv_proj = nn.Linear(hid_dim + self.d_tau, hid_dim)
-        self.layer_norm = nn.LayerNorm(hid_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, notes_input: torch.Tensor, tau: torch.Tensor):
-        """
-        notes_input:     (B, K_max, d_txt_in), zero-padded report embeddings
-        tau:             (B, K_max), raw report timestamps in history units
-        returns:
-          tokens:          (B, max(K_max, 1), hid_dim)
-          padding_mask:    (B, max(K_max, 1)); True means ignore
-          has_text:        (B,) bool
-        """
-        if notes_input.ndim != 3:
-            raise ValueError(
-                "notes_input must have shape (B, K_max, d_txt_in), got "
-                f"{tuple(notes_input.shape)}"
-            )
-        if tau.ndim != 2 or tau.shape[:2] != notes_input.shape[:2]:
-            raise ValueError(
-                "tau must have shape (B, K_max) matching notes_input; got "
-                f"notes={tuple(notes_input.shape)}, tau={tuple(tau.shape)}"
-            )
-
-        batch_size, n_notes, _ = notes_input.shape
-        if n_notes == 0:
-            tokens = notes_input.new_zeros((batch_size, 1, self.proj_in.out_features))
-            padding_mask = torch.zeros(
-                (batch_size, 1), dtype=torch.bool, device=notes_input.device
-            )
-            has_text = torch.zeros(
-                batch_size, dtype=torch.bool, device=notes_input.device
-            )
-            return tokens, padding_mask, has_text
-
-        note_mask = notes_input.abs().sum(dim=-1) > 0
-        has_text = note_mask.any(dim=1)
-        tau_norm = (tau / self.history_window).clamp(0.0, 1.0)
-
-        content = self.proj_in(notes_input)
-        tau_feat = self.time2vec(tau_norm.unsqueeze(-1))
-        tokens = self.kv_proj(torch.cat([content, tau_feat], dim=-1))
-        tokens = self.dropout(self.layer_norm(tokens))
-        tokens = tokens * note_mask.unsqueeze(-1).to(tokens.dtype)
-
-        padding_mask = ~note_mask
-        empty_rows = ~has_text
-        if empty_rows.any():
-            # Keep a single zero dummy token visible to attention. The
-            # injection mask below guarantees it cannot affect the numeric path.
-            padding_mask = padding_mask.clone()
-            padding_mask[empty_rows, 0] = False
-            tokens = tokens.clone()
-            tokens[empty_rows, 0] = 0.0
-
-        return tokens, padding_mask, has_text
-
-
-class VariableTextInjection(nn.Module):
-    """Let numerical MTGNN variable nodes read the K report-event tokens.
-
-    Queries are produced from each variable's numerical hidden trajectory,
-    plus a learned variable identity. The resulting variable-specific text
-    message is injected as static patient context before graph propagation;
-    it is not interpreted as a report observed at each hourly grid point.
-    """
-
-    def __init__(
-        self,
-        num_nodes: int,
-        hidden: int,
-        n_heads: int = 1,
-        dropout: float = 0.1,
-        gate_bias: float = -1.0,
-    ):
-        super().__init__()
-        if hidden % n_heads != 0:
-            raise ValueError(
-                f"hidden={hidden} must be divisible by n_heads={n_heads}"
-            )
-        self.variable_embed = nn.Parameter(torch.randn(num_nodes, hidden) * 0.02)
-        self.query_norm = nn.LayerNorm(hidden)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=hidden,
-            num_heads=n_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.context_norm = nn.LayerNorm(hidden)
-        self.delta = nn.Sequential(
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, hidden),
-        )
-        self.gate = nn.Linear(2 * hidden, hidden)
-        nn.init.constant_(self.gate.bias, gate_bias)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, h, text_tokens, text_padding_mask, has_text):
-        """
-        h:                 (B, hidden, N, T)
-        text_tokens:       (B, K, hidden)
-        text_padding_mask: (B, K), True means ignore
-        has_text:          (B,) bool
-        """
-        batch_size, hidden, num_nodes, _ = h.shape
-        variable_state = h.mean(dim=-1).permute(0, 2, 1)
-        query = self.query_norm(
-            variable_state + self.variable_embed.unsqueeze(0)
-        )
-
-        context, attn_weights = self.attn(
-            query,
-            text_tokens,
-            text_tokens,
-            key_padding_mask=text_padding_mask,
-            need_weights=True,
-        )
-        has_text_bnc = has_text.view(batch_size, 1, 1)
-        context = torch.where(
-            has_text_bnc, self.context_norm(context), torch.zeros_like(context)
-        )
-
-        gate = torch.sigmoid(self.gate(torch.cat([query, context], dim=-1)))
-        update = gate * self.delta(context)
-        update = update * has_text_bnc.to(update.dtype)
-        update = self.dropout(update).permute(0, 2, 1).unsqueeze(-1)
-
-        return h + update, attn_weights, gate
-
-
-# ─────────────────────────────────────────────────────────────────────────
 # MTGNN-style backbone (encoder mode: pools to a per-node hidden vector
 # instead of directly emitting a fixed prediction horizon)
 # ─────────────────────────────────────────────────────────────────────────
@@ -383,9 +201,6 @@ class MTGNNEncoder(nn.Module):
         dropout=0.3,
     ):
         super().__init__()
-        self.num_nodes = int(num_nodes)
-        self.hidden = int(hidden)
-        self.n_layers = int(layers)
         self.seq_length = seq_length
         self.start = nn.Conv2d(in_channels, hidden, 1)
         self.graph = GraphConstructor(num_nodes, subgraph_size, node_dim=node_dim)
@@ -403,94 +218,17 @@ class MTGNNEncoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.temporal_agg = nn.Linear(hidden * seq_length, hid_dim)
 
-        # Configured by GPINet only after every numeric-path module has been
-        # initialized. Keeping text construction separate preserves the
-        # numerical parameter initialization used by Uni runs.
-        self.text_event_encoder = None
-        self.text_injections = nn.ModuleList()
-        self.last_text_gate_mean = None
-        self.last_text_attention_entropy = None
-
-    def configure_text_fusion(
-        self,
-        d_txt_in,
-        history_window,
-        n_heads=1,
-        dropout=0.1,
-        gate_bias=-1.0,
-    ):
-        """Attach feature-level text modules to every MTGNN block."""
-        self.text_event_encoder = TextEventEncoder(
-            d_txt_in=int(d_txt_in),
-            hid_dim=self.hidden,
-            history_window=float(history_window),
-            dropout=float(dropout),
-        )
-        self.text_injections = nn.ModuleList(
-            [
-                VariableTextInjection(
-                    num_nodes=self.num_nodes,
-                    hidden=self.hidden,
-                    n_heads=int(n_heads),
-                    dropout=float(dropout),
-                    gate_bias=float(gate_bias),
-                )
-                for _ in range(self.n_layers)
-            ]
-        )
-
-    def forward(self, x, notes_input=None, tau=None):
+    def forward(self, x):
         # x: (B, C_in, N, T)
         if x.shape[-1] != self.seq_length:
             raise ValueError(f"MTGNNEncoder expected sequence length {self.seq_length}, got {x.shape[-1]}")
-
-        text_tokens = text_padding_mask = has_text = None
-        if notes_input is not None:
-            if tau is None:
-                raise ValueError("tau is required when notes_input is provided")
-            if self.text_event_encoder is None or len(self.text_injections) == 0:
-                raise RuntimeError(
-                    "MTGNN native text fusion was not configured. Instantiate "
-                    "GPINet with enable_text=True and use_text_embeddings=True."
-                )
-            text_tokens, text_padding_mask, has_text = self.text_event_encoder(
-                notes_input, tau
-            )
-
         adjacency = self.graph()
         h = self.start(x)
-        gate_means = []
-        attention_entropies = []
-        for layer_idx, block in enumerate(self.blocks):
+        for block in self.blocks:
             residual = h
             h = torch.tanh(block["temporal"](h))
-
-            # Text enters the MTGNN representation between temporal feature
-            # extraction and graph propagation. K report events stay K events;
-            # the returned message is variable-specific, not a 24-point text
-            # pseudo-series.
-            if text_tokens is not None:
-                h, attn_weights, gate = self.text_injections[layer_idx](
-                    h, text_tokens, text_padding_mask, has_text
-                )
-                valid_rows = has_text.view(-1, 1, 1)
-                if valid_rows.any():
-                    gate_means.append(gate[valid_rows.expand_as(gate)].mean())
-                    probs = attn_weights.clamp_min(1e-8)
-                    entropy = -(probs * probs.log()).sum(dim=-1)
-                    attention_entropies.append(entropy[has_text].mean())
-
             h = block["graph"](h, adjacency)
             h = block["norm"](h + residual)
-
-        self.last_text_gate_mean = (
-            torch.stack(gate_means).mean().detach() if gate_means else None
-        )
-        self.last_text_attention_entropy = (
-            torch.stack(attention_entropies).mean().detach()
-            if attention_entropies
-            else None
-        )
         h = self.dropout(F.relu(h))  # (B, hidden, N, T)
         b, hd, n, t = h.shape
         h = h.permute(0, 2, 1, 3).reshape(b, n, hd * t)
@@ -518,11 +256,9 @@ class LearnableTE(nn.Module):
 
 
 class GPINet(nn.Module):
-    """GP interpolation -> MTGNN internal text fusion -> query decoder.
-
-    `notes_input=None` selects the unchanged numerical path. Supplying report
-    embeddings and their raw timestamps keeps the reports as K independent
-    events and lets MTGNN variable nodes attend to them inside its blocks.
+    """GP interpolation -> Gauss-Hermite fusion -> MTGNN encoder -> per-query
+    decoder. Numeric-only; text fusion is applied externally via
+    fusions/FusionModel.py, same as every other model in this repo.
     """
 
     def __init__(self, args, supports=None, dropout=0):
@@ -533,12 +269,8 @@ class GPINet(nn.Module):
         self.te_dim = args.te_dim
 
         history_frac = float(args.history) / float(args.history + args.pred_window)
-        # Bind the number of GP query points to pred_window (== out_dim),
-        # matching the original gpinet_mm.py/model.py convention
-        # (`t_query = linspace(0, history_frac, out_dim + 1)[:out_dim]`).
-        # `gpinet_query_points` can still override this explicitly if set.
-        n_query = int(getattr(args, "gpinet_query_points", 0)) or int(args.pred_window)
-        t_query = torch.linspace(0.0, history_frac, n_query + 1)[:n_query]
+        n_query = int(getattr(args, "gpinet_query_points", 8))
+        t_query = torch.linspace(0.0, history_frac, n_query)
 
         self.gp = BatchedGPInterpolator(
             self.N,
@@ -577,53 +309,15 @@ class GPINet(nn.Module):
         self.last_mll = None
         self.last_valid_pairs = None
 
-        # Configure native text modules only for the multimodal/precomputed
-        # route. Construction happens after every numerical module and inside
-        # a forked RNG context: numeric weights and the caller's RNG stream are
-        # therefore unchanged relative to a Uni model initialized with the
-        # same seed.
-        self.native_text_enabled = bool(
-            getattr(args, "enable_text", False)
-            and getattr(args, "use_text_embeddings", False)
-        )
-        if self.native_text_enabled:
-            text_seed = int(getattr(args, "seed", 0)) + 104729
-            with torch.random.fork_rng(devices=[], enabled=True):
-                torch.manual_seed(text_seed)
-                self.backbone.configure_text_fusion(
-                    d_txt_in=int(getattr(args, "d_txt", 768)),
-                    history_window=float(args.history),
-                    n_heads=int(getattr(args, "n_heads_fusion", 1)),
-                    dropout=float(args.dropout),
-                    gate_bias=float(
-                        getattr(args, "gpinet_text_gate_bias", -1.0)
-                    ),
-                )
-
-        self.last_text_gate_mean = None
-        self.last_text_attention_entropy = None
-
     def get_hyperparams(self):
         return self.gp.get_hyperparams()
 
-    def forecasting(
-        self,
-        time_steps_to_predict,
-        X,
-        truth_time_steps,
-        mask=None,
-        notes_input=None,
-        tau=None,
-    ):
+    def forecasting(self, time_steps_to_predict, X, truth_time_steps, mask=None):
         """
         time_steps_to_predict: (B, Lp)        normalized query times in [0,1]
         X (observed_data):     (B, T_obs, N)
         truth_time_steps:      (B, T_obs)     shared time axis across variables
         mask (observed_mask):  (B, T_obs, N)
-        notes_input: optional (B, K_max, d_txt) precomputed report embeddings.
-            Reports remain K independent events inside the MTGNN backbone.
-        tau: optional (B, N_max) RAW (unnormalized) note timestamps,
-            required if notes_input is provided.
         returns:                (B, Lp, N)
         """
         B, T_obs, N = X.shape
@@ -643,22 +337,7 @@ class GPINet(nn.Module):
         gp_input = F.pad(gp_input, (1, 0, 0, 0))  # (B, 2, N, Q+1)
         fused = self.fusion(gp_input[:, 0:1], gp_input[:, 1:2])  # (B, hid_dim, N, Q+1)
 
-        if notes_input is not None and not self.native_text_enabled:
-            raise RuntimeError(
-                "notes_input was supplied but native text fusion is disabled. "
-                "Instantiate GPINet with enable_text=True and "
-                "use_text_embeddings=True."
-            )
-
-        h = self.backbone(
-            fused,
-            notes_input=notes_input,
-            tau=tau,
-        )  # (B, N, hid_dim)
-        self.last_text_gate_mean = self.backbone.last_text_gate_mean
-        self.last_text_attention_entropy = (
-            self.backbone.last_text_attention_entropy
-        )
+        h = self.backbone(fused)  # (B, N, hid_dim)
 
         Lp = time_steps_to_predict.shape[1]
         h_exp = h.unsqueeze(2).expand(B, N, Lp, self.hid_dim)

@@ -13,23 +13,6 @@ from torch.distributions.multivariate_normal import MultivariateNormal
 from torch.distributions.normal import Normal
 from torch.distributions import kl_divergence, Independent
 
-# GPINet (added 2026-08-09) can optionally consume text natively inside
-# forecasting() instead of via the generic post-hoc fusion() call every
-# other model uses -- see models/GPINet.py's module docstring. Import is
-# wrapped the same defensive way main.py wraps all its model imports, so a
-# broken/missing GPINet dependency only disables this GPINet-specific
-# routing (isinstance(model, GPINet) below just becomes always-False) rather
-# than breaking evaluation.py -- and therefore every other model -- entirely.
-try:
-    from models.GPINet import GPINet
-except Exception as _gpinet_import_err:  # noqa: BLE001
-    GPINet = None
-    print(
-        f"[WARN] lib/evaluation.py could not import GPINet for native-text "
-        f"routing: {_gpinet_import_err!r}. GPINet will fall back to the "
-        "generic post-hoc fusion() path like every other model."
-    )
-
 
 def compute_error(truth, pred_y, mask, func, reduce, norm_dict=None):
     # pred_y shape [n_traj_samples, n_batch, n_tp, n_dim]
@@ -93,40 +76,17 @@ def compute_all_losses(
     # Make predictions for all the points
     # shape of pred --- [n_traj_samples=1, n_batch, n_tp, n_dim]
 
-    # GPINet: with precomputed embeddings, route the K timestamped reports
-    # natively into forecasting(). MTGNN variable nodes attend to the report
-    # event set inside the backbone; no 24-point text pseudo-series and no
-    # generic post-hoc output fusion are used. Raw-text fallback remains on
-    # the generic path because the native encoder expects embeddings.
-    # Every other model, and GPINet with this disabled, is unaffected.
-    use_native_gpinet_text = (
-        enable_text
-        and use_text_embeddings
-        and GPINet is not None
-        and isinstance(model, GPINet)
+    pred_y = model.forecasting(
+        batch_dict["tp_to_predict"],
+        batch_dict["observed_data"],
+        batch_dict["observed_tp"],
+        batch_dict["observed_mask"],
     )
-
-    if use_native_gpinet_text:
-        pred_y = model.forecasting(
-            batch_dict["tp_to_predict"],
-            batch_dict["observed_data"],
-            batch_dict["observed_tp"],
-            batch_dict["observed_mask"],
-            notes_input=batch_dict["notes_embeddings"],
-            tau=batch_dict.get("tau_raw", batch_dict["tau"]),
-        )
-    else:
-        pred_y = model.forecasting(
-            batch_dict["tp_to_predict"],
-            batch_dict["observed_data"],
-            batch_dict["observed_tp"],
-            batch_dict["observed_mask"],
-        )
     if torch.isnan(pred_y).any():
         print(f"pred_y: {pred_y}")
         raise ValueError("pred_y contains NaN values.")
 
-    if enable_text and fusion is not None and not use_native_gpinet_text:
+    if enable_text and fusion is not None:
         notes_input = (
             batch_dict["notes_embeddings"]
             if use_text_embeddings
@@ -233,8 +193,6 @@ def evaluation(model, fusion, dataloader, enable_text=True, use_text_embeddings=
 
     n_eval_samples = 0
     n_eval_samples_mape = 0
-    text_gate_values = []
-    text_attention_entropy_values = []
     total_results = {}
     total_results["loss"] = 0
     total_results["mse"] = 0
@@ -244,44 +202,14 @@ def evaluation(model, fusion, dataloader, enable_text=True, use_text_embeddings=
 
     # for _ in range(n_batches):
     for step, batch_dict in enumerate(tqdm(dataloader)):
-        # GPINet (2026-08-09): see the matching block in compute_all_losses()
-        # above for the full explanation. Kept in sync with that function on
-        # purpose -- if you change one, change the other.
-        use_native_gpinet_text = (
-            enable_text
-            and use_text_embeddings
-            and GPINet is not None
-            and isinstance(model, GPINet)
+        pred_y = model.forecasting(
+            batch_dict["tp_to_predict"],
+            batch_dict["observed_data"],
+            batch_dict["observed_tp"],
+            batch_dict["observed_mask"],
         )
 
-        if use_native_gpinet_text:
-            pred_y = model.forecasting(
-                batch_dict["tp_to_predict"],
-                batch_dict["observed_data"],
-                batch_dict["observed_tp"],
-                batch_dict["observed_mask"],
-                notes_input=batch_dict["notes_embeddings"],
-                tau=batch_dict.get("tau_raw", batch_dict["tau"]),
-            )
-        else:
-            pred_y = model.forecasting(
-                batch_dict["tp_to_predict"],
-                batch_dict["observed_data"],
-                batch_dict["observed_tp"],
-                batch_dict["observed_mask"],
-            )
-
-        if use_native_gpinet_text:
-            gate_mean = getattr(model, "last_text_gate_mean", None)
-            attention_entropy = getattr(
-                model, "last_text_attention_entropy", None
-            )
-            if gate_mean is not None:
-                text_gate_values.append(float(gate_mean))
-            if attention_entropy is not None:
-                text_attention_entropy_values.append(float(attention_entropy))
-
-        if enable_text and fusion is not None and not use_native_gpinet_text:
+        if enable_text and fusion is not None:
             notes_input = (
                 batch_dict["notes_embeddings"]
                 if use_text_embeddings
@@ -351,12 +279,5 @@ def evaluation(model, fusion, dataloader, enable_text=True, use_text_embeddings=
         if isinstance(var, torch.Tensor):
             var = var.item()
         total_results[key] = var
-
-    if text_gate_values:
-        total_results["text_gate_mean"] = float(np.mean(text_gate_values))
-    if text_attention_entropy_values:
-        total_results["text_attention_entropy"] = float(
-            np.mean(text_attention_entropy_values)
-        )
 
     return total_results
