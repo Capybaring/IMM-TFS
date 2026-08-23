@@ -88,8 +88,11 @@ class TTF_SemTime_Slots(nn.Module):
         )
         nn.init.constant_(self.time_gate[-1].bias, float(time_gate_bias))
 
-        self.output_norm = nn.LayerNorm(self.d_txt)
-        self.output_proj = nn.Linear(self.d_txt, self.d_txt)
+        # Keep slot boundaries explicit for MMF_VarTime_SlotGate.  A global
+        # d_txt -> d_txt projection would mix dimensions from different slots
+        # before MMF has a chance to select them.
+        self.slot_output_norm = nn.LayerNorm(self.slot_dim)
+        self.slot_output_proj = nn.Linear(self.slot_dim, self.slot_dim)
         self.dropout = nn.Dropout(dropout)
 
         # Optional diagnostics; populated during forward without changing the
@@ -242,8 +245,12 @@ class TTF_SemTime_Slots(nn.Module):
         slot_outputs = torch.einsum(
             "bhtk,bhkd->bhtd", fused_weights, values
         )
-        E_raw = slot_outputs.permute(0, 2, 1, 3).reshape(B, T_f, self.d_txt)
-        E_txt = self.output_proj(self.dropout(self.output_norm(E_raw)))
+        slot_outputs = self.slot_output_proj(
+            self.dropout(self.slot_output_norm(slot_outputs))
+        )
+        E_txt = slot_outputs.permute(0, 2, 1, 3).reshape(
+            B, T_f, self.d_txt
+        )
         E_txt = E_txt * M_txt[:, :, None].to(E_txt.dtype)
 
         self.last_semantic_weights = semantic_weights.detach()

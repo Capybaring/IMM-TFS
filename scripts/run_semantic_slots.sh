@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Formal sample-size runner for expanded MIMIC.
+# Semantic-slot GPINet runner for expanded MIMIC.
 #
 # IMPORTANT: in this script -n means NUMBER OF TRAIN SUBJECTS.
 # Validation/test subjects are fixed globally and never shrink/change with N.
@@ -15,7 +15,7 @@ SWEEP_MODES="both"
 OUTPUT_DIR=""
 GPU=0
 EPOCHS=50
-BATCH_SIZE=32
+BATCH_SIZE=16
 PATIENCE=5
 MODEL_SEED=1
 LOADER_SEED=314159
@@ -40,17 +40,22 @@ DROPOUT=0.3
 TEXT_HEADS=1
 TEXT_GATE_BIAS=-1.0
 
-TTF_MODULE="TTF_T2V_XAttn"
-MMF_MODULE="MMF_XAttn_Add"
+TTF_MODULE="TTF_SemTime_Slots"
+MMF_MODULE="MMF_VarTime_SlotGate"
 SEMANTIC_SLOTS=4
-RECENCY_SIGMA=1.0
+RECENCY_SIGMA=0.25
 SEMANTIC_TIME_GATE_BIAS=-1.0
+MMF_SLOT_ATTN_DIM=128
+MMF_SLOT_GATE_BIAS=-1.0
+KAPPA=0.5
+USE_AMP=0
+DETECT_ANOMALY=0
 
 usage() {
 cat <<'EOF'
 Usage:
-  ./scripts/run_gpinet_fixed.sh -n TRAIN_N [options]
-  ./scripts/run_gpinet_fixed.sh --sweep [options]
+  ./scripts/run_semantic_slots.sh -n TRAIN_N [options]
+  ./scripts/run_semantic_slots.sh --sweep [options]
 
 Options:
   -n, --num N           Number of TRAIN subjects (default: 1000)
@@ -60,34 +65,44 @@ Options:
   --modes MODE          Sweep modes: both, uni, or text (default: both)
   --output-dir DIR      Sweep log directory (default: timestamped directory)
   --epochs N            Epochs (default: 50)
-  --batch-size N        Batch size (default: 32)
+  --batch-size N        Batch size (default: 16)
   --patience N          Early stopping patience (default: 5)
   --gpu ID              GPU id for main.py (default: 0)
   --seed N              Model/training seed (default: 1)
   --loader-seed N       Fixed DataLoader shuffle seed (default: 314159)
   --text-heads N        Attention heads used by fusion modules (default: 1)
   --text-gate-bias X    Legacy GPINet internal text-gate bias (default: -1.0)
-  --TTF_module NAME      TTF module passed to main.py (default: TTF_T2V_XAttn)
-  --MMF_module NAME      MMF module passed to main.py (default: MMF_XAttn_Add)
+  --TTF_module NAME      TTF module passed to main.py (default: TTF_SemTime_Slots)
+  --MMF_module NAME      MMF module passed to main.py (default: MMF_VarTime_SlotGate)
   --semantic_slots N     Semantic slots for TTF_SemTime_Slots (default: 4)
-  --recency_sigma X      Gaussian recency sigma on normalized time (default: 1.0)
+  --recency_sigma X      Gaussian recency sigma on normalized time (default: 0.25)
   --semantic_time_gate_bias X
                         Initial adaptive time-gate bias (default: -1.0)
+  --mmf_slot_attn_dim N MMF slot-attention dimension (default: 128)
+  --mmf_slot_gate_bias X
+                        Initial MMF residual-gate bias (default: -1.0)
+  --kappa X             Maximum text residual scale (default: 0.5)
+  --amp                 Enable automatic mixed precision
+  --detect-anomaly      Enable expensive autograd anomaly detection
   -h, --help            Show this help
 
 Examples:
-  ./scripts/run_gpinet_fixed.sh -n 1000
-  ./scripts/run_gpinet_fixed.sh -n 1000 --text
-  ./scripts/run_gpinet_fixed.sh --sweep
-  ./scripts/run_gpinet_fixed.sh --sweep --epochs 50 --patience 10
-  ./scripts/run_gpinet_fixed.sh --sweep --modes text --sizes 1000,2000,4000,6000,8000
-  ./scripts/run_gpinet_fixed.sh -n 1000 --epochs 50 --patience 10
-  ./scripts/run_gpinet_fixed.sh -n 1000 --text --epochs 50 --patience 10
-  ./scripts/run_gpinet_fixed.sh -n 1000 --text \
+  ./scripts/run_semantic_slots.sh -n 1000
+  ./scripts/run_semantic_slots.sh -n 1000 --text
+  ./scripts/run_semantic_slots.sh --sweep
+  ./scripts/run_semantic_slots.sh --sweep --epochs 50 --patience 10
+  ./scripts/run_semantic_slots.sh --sweep --modes text --sizes 1000,2000,4000,6000,8000
+  ./scripts/run_semantic_slots.sh -n 1000 --epochs 50 --patience 10
+  ./scripts/run_semantic_slots.sh -n 1000 --text --epochs 50 --patience 10
+  ./scripts/run_semantic_slots.sh -n 1000 --text \
     --TTF_module TTF_SemTime_Slots \
     --semantic_slots 4 \
     --recency_sigma 0.25 \
-    --semantic_time_gate_bias -1.0
+    --semantic_time_gate_bias -1.0 \
+    --MMF_module MMF_VarTime_SlotGate \
+    --mmf_slot_attn_dim 128 \
+    --mmf_slot_gate_bias -1.0 \
+    --kappa 0.5
 
 Sweep outputs:
   <output-dir>/final_metrics.log                  readable MSE/MAE summary
@@ -129,6 +144,13 @@ while [[ $# -gt 0 ]]; do
         --recency_sigma|--recency-sigma) RECENCY_SIGMA="$2"; shift 2 ;;
         --semantic_time_gate_bias|--semantic-time-gate-bias)
             SEMANTIC_TIME_GATE_BIAS="$2"; shift 2 ;;
+        --mmf_slot_attn_dim|--mmf-slot-attn-dim)
+            MMF_SLOT_ATTN_DIM="$2"; shift 2 ;;
+        --mmf_slot_gate_bias|--mmf-slot-gate-bias)
+            MMF_SLOT_GATE_BIAS="$2"; shift 2 ;;
+        --kappa) KAPPA="$2"; shift 2 ;;
+        --amp) USE_AMP=1; shift ;;
+        --detect-anomaly) DETECT_ANOMALY=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; usage >&2; exit 1 ;;
     esac
@@ -140,7 +162,8 @@ for pair in \
     "BATCH_SIZE:$BATCH_SIZE" \
     "PATIENCE:$PATIENCE" \
     "TEXT_HEADS:$TEXT_HEADS" \
-    "SEMANTIC_SLOTS:$SEMANTIC_SLOTS"; do
+    "SEMANTIC_SLOTS:$SEMANTIC_SLOTS" \
+    "MMF_SLOT_ATTN_DIM:$MMF_SLOT_ATTN_DIM"; do
     name="${pair%%:*}"; value="${pair#*:}"
     if ! [[ "$value" =~ ^[0-9]+$ ]] || [[ "$value" -le 0 ]]; then
         echo "Error: $name must be a positive integer, got $value" >&2
@@ -176,7 +199,7 @@ if [[ "$SWEEP" -eq 1 ]]; then
     done
 
     if [[ -z "$OUTPUT_DIR" ]]; then
-        OUTPUT_DIR="$REPO_ROOT/logs/gpinet_fixed_sweep/$(date '+%Y%m%d_%H%M%S')"
+        OUTPUT_DIR="$REPO_ROOT/logs/gpinet_semantic_slots_sweep/$(date '+%Y%m%d_%H%M%S')"
     elif [[ "$OUTPUT_DIR" != /* ]]; then
         OUTPUT_DIR="$REPO_ROOT/$OUTPUT_DIR"
     fi
@@ -187,7 +210,7 @@ if [[ "$SWEEP" -eq 1 ]]; then
     SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 
     {
-        echo "GPINet fixed-protocol sweep"
+        echo "GPINet semantic-slot fixed-protocol sweep"
         echo "started_at       : $(date '+%Y-%m-%d %H:%M:%S %z')"
         echo "train_sizes      : $SWEEP_SIZES_CSV"
         echo "modes            : $SWEEP_MODES"
@@ -198,6 +221,9 @@ if [[ "$SWEEP" -eq 1 ]]; then
         echo "semantic slots   : $SEMANTIC_SLOTS"
         echo "recency sigma    : $RECENCY_SIGMA"
         echo "time gate bias   : $SEMANTIC_TIME_GATE_BIAS"
+        echo "MMF attn dim     : $MMF_SLOT_ATTN_DIM"
+        echo "MMF gate bias    : $MMF_SLOT_GATE_BIAS"
+        echo "text scale kappa : $KAPPA"
         echo "epochs/patience  : $EPOCHS/$PATIENCE"
         echo "batch_size       : $BATCH_SIZE"
         echo "output_directory : $OUTPUT_DIR"
@@ -236,7 +262,16 @@ if [[ "$SWEEP" -eq 1 ]]; then
                 --semantic_slots "$SEMANTIC_SLOTS"
                 --recency_sigma "$RECENCY_SIGMA"
                 --semantic_time_gate_bias "$SEMANTIC_TIME_GATE_BIAS"
+                --mmf_slot_attn_dim "$MMF_SLOT_ATTN_DIM"
+                --mmf_slot_gate_bias "$MMF_SLOT_GATE_BIAS"
+                --kappa "$KAPPA"
             )
+            if [[ "$USE_AMP" -eq 1 ]]; then
+                RUN_CMD+=(--amp)
+            fi
+            if [[ "$DETECT_ANOMALY" -eq 1 ]]; then
+                RUN_CMD+=(--detect-anomaly)
+            fi
             if [[ "$text_flag" -eq 1 ]]; then
                 RUN_CMD+=(--text)
             fi
@@ -367,6 +402,7 @@ echo "model seed            : $MODEL_SEED"
 echo "loader seed           : $LOADER_SEED"
 echo "epochs / patience     : $EPOCHS / $PATIENCE"
 echo "batch size            : $BATCH_SIZE"
+echo "AMP / anomaly detect  : $USE_AMP / $DETECT_ANOMALY"
 echo "normalization         : fixed FULL-TRAIN HISTORY"
 if [[ "$ENABLE_TEXT" -eq 1 ]]; then
     echo "TTF / MMF             : $TTF_MODULE / $MMF_MODULE"
@@ -374,6 +410,8 @@ if [[ "$ENABLE_TEXT" -eq 1 ]]; then
     echo "semantic slots        : $SEMANTIC_SLOTS"
     echo "recency sigma         : $RECENCY_SIGMA"
     echo "semantic time bias    : $SEMANTIC_TIME_GATE_BIAS"
+    echo "MMF attn dim / bias   : $MMF_SLOT_ATTN_DIM / $MMF_SLOT_GATE_BIAS"
+    echo "text scale kappa      : $KAPPA"
     echo "legacy GP gate bias   : $TEXT_GATE_BIAS"
 fi
 echo "=================================================================="
@@ -471,7 +509,17 @@ if [[ "$ENABLE_TEXT" -eq 1 ]]; then
         --semantic_slots "$SEMANTIC_SLOTS"
         --recency_sigma "$RECENCY_SIGMA"
         --semantic_time_gate_bias "$SEMANTIC_TIME_GATE_BIAS"
+        --mmf_slot_attn_dim "$MMF_SLOT_ATTN_DIM"
+        --mmf_slot_gate_bias "$MMF_SLOT_GATE_BIAS"
+        --kappa "$KAPPA"
     )
+fi
+
+if [[ "$USE_AMP" -eq 1 ]]; then
+    CMD+=(--use_amp)
+fi
+if [[ "$DETECT_ANOMALY" -eq 1 ]]; then
+    CMD+=(--detect_anomaly)
 fi
 
 echo
@@ -483,3 +531,4 @@ echo
 
 echo
 echo "### Done: fixed protocol / train_N=$TRAIN_N / text=$ENABLE_TEXT / model_seed=$MODEL_SEED ###"
+
