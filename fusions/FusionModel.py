@@ -5,19 +5,23 @@ import torch.nn as nn
 from fusions.TTF_RecAvg import TTF_RecAvg
 
 from fusions.TTF_T2V_XAttn import TTF_T2V_XAttn
+from fusions.TTF_SemTime_Slots import TTF_SemTime_Slots
 # from fusions.TTF_T2V_XAttn_old import TTF_T2V_XAttn
 # from fusions.TTF_T2V_XAttn_new import TTF_T2V_XAttn
 from fusions.MMF_GR_Add import MMF_GR_Add
 from fusions.MMF_XAttn_Add import MMF_XAttn_Add
+from fusions.MMF_VarTime_SlotGate import MMF_VarTime_SlotGate
 
 # Maps for string-based lookup
 _TTF_CLASSES = {
     "TTF_RecAvg": TTF_RecAvg,
     "TTF_T2V_XAttn": TTF_T2V_XAttn,
+    "TTF_SemTime_Slots": TTF_SemTime_Slots,
 }
 _MMF_CLASSES = {
     "MMF_GR_Add": MMF_GR_Add,
     "MMF_XAttn_Add": MMF_XAttn_Add,
+    "MMF_VarTime_SlotGate": MMF_VarTime_SlotGate,
 }
 
 
@@ -64,6 +68,22 @@ class FusionModel(nn.Module):
                 dropout=args.dropout,
                 d_txt=args.d_txt,
             )
+        elif TTF_cls is TTF_SemTime_Slots:
+            self.ttf = TTF_cls(
+                args.llm_model_fusion,
+                args.llm_layers_fusion,
+                max_length=args.max_length,
+                device=args.device,
+                use_text_embeddings=args.use_text_embeddings,
+                n_heads_fusion=args.n_heads_fusion,
+                dropout=args.dropout,
+                d_txt=args.d_txt,
+                semantic_slots=getattr(args, "semantic_slots", 4),
+                recency_sigma=args.recency_sigma,
+                time_gate_bias=getattr(
+                    args, "semantic_time_gate_bias", -1.0
+                ),
+            )
         else:
             self.ttf = TTF_cls(
                 args.llm_model_fusion,
@@ -84,6 +104,17 @@ class FusionModel(nn.Module):
                 C=args.C,
                 hidden_dim=args.C,
                 dropout=args.dropout,
+            )
+        elif MMF_cls is MMF_VarTime_SlotGate:
+            self.mmf = MMF_cls(
+                d_txt=d_txt,
+                C=args.C,
+                d_attn=getattr(args, "mmf_slot_attn_dim", 128),
+                n_heads_fusion=args.n_heads_fusion,
+                dropout=args.dropout,
+                kappa=args.kappa,
+                semantic_slots=getattr(args, "semantic_slots", 4),
+                gate_bias=getattr(args, "mmf_slot_gate_bias", -1.0),
             )
         else:
             self.mmf = MMF_cls(
@@ -107,7 +138,11 @@ class FusionModel(nn.Module):
         if torch.isnan(E_txt).any():
             raise ValueError("E_txt contains NaN values.")
         # print(f"M_txt: {M_txt}")
-        Y_out = self.mmf(Y_ts, E_txt, M_txt)
+        if isinstance(self.mmf, MMF_VarTime_SlotGate):
+            Y_out = self.mmf(Y_ts, E_txt, M_txt, t_hat=t_hat)
+        else:
+            Y_out = self.mmf(Y_ts, E_txt, M_txt)
         if torch.isnan(Y_out).any():
             raise ValueError("Y_out contains NaN values.")
         return Y_out
+

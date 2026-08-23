@@ -641,14 +641,14 @@ def get_args_from_parser() -> argparse.Namespace:
         "--TTF_module",
         type=str,
         default="TTF_T2V_XAttn",
-        choices=["TTF_RecAvg", "TTF_T2V_XAttn"],
+        choices=["TTF_RecAvg", "TTF_T2V_XAttn", "TTF_SemTime_Slots"],
         help="Timestamp-to-Time Fusion module",
     )
     parser.add_argument(
         "--MMF_module",
         type=str,
         default="MMF_XAttn_Add",
-        choices=["MMF_GR_Add", "MMF_XAttn_Add"],
+        choices=["MMF_GR_Add", "MMF_XAttn_Add", "MMF_VarTime_SlotGate"],
         help="Multimodal Fusion module",
     )
     parser.add_argument(
@@ -679,7 +679,19 @@ def get_args_from_parser() -> argparse.Namespace:
         "--recency_sigma",
         type=float,
         default=1.0,
-        help="Recency sigma for TTF_RecAvg module",
+        help="Recency sigma for recency-aware TTF modules",
+    )
+    parser.add_argument(
+        "--semantic_slots",
+        type=int,
+        default=4,
+        help="Number of latent semantic slots in TTF_SemTime_Slots",
+    )
+    parser.add_argument(
+        "--semantic_time_gate_bias",
+        type=float,
+        default=-1.0,
+        help="Initial adaptive time-gate bias in TTF_SemTime_Slots",
     )
     parser.add_argument(
         "--n_heads_fusion",
@@ -697,10 +709,22 @@ def get_args_from_parser() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--mmf_slot_attn_dim",
+        type=int,
+        default=128,
+        help="Attention dimension in MMF_VarTime_SlotGate",
+    )
+    parser.add_argument(
+        "--mmf_slot_gate_bias",
+        type=float,
+        default=-1.0,
+        help="Initial residual-gate bias in MMF_VarTime_SlotGate",
+    )
+    parser.add_argument(
         "--kappa",
         type=float,
         default=0.5,
-        help="Weight for the text‐time fusion module in MMF_XAttn_Add",
+        help="Text correction scale used by residual MMF modules",
     )
 
     # ── Training Hyperparameters ─────────────────────────────────────────────────
@@ -738,6 +762,15 @@ def get_args_from_parser() -> argparse.Namespace:
         default=False,
         # default=True,
         help="Enable Automatic Mixed Precision (AMP) training",
+    )
+    parser.add_argument(
+        "--detect_anomaly",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable PyTorch autograd anomaly detection. Intended only for "
+            "debugging because it increases runtime and memory usage."
+        ),
     )
 
     # ── Logging & Checkpointing ──────────────────────────────────────────────────
@@ -1107,8 +1140,8 @@ def trainable(
             fusion.train()
         iter_data = tqdm(data_obj["train_dataloader"], desc="Training")
         for step, batch_dict in enumerate(iter_data):
-            optimizer.zero_grad()
-            # with torch.autograd.set_detect_anomaly(True):
+            optimizer.zero_grad(set_to_none=True)
+            # with torch.autograd.set_detect_anomaly(args.detect_anomaly):
             #     train_res = compute_all_losses(
             #         model, fusion, batch_dict, args.enable_text
             #     )
@@ -1120,7 +1153,7 @@ def trainable(
             # current_loss = train_res["loss"].item()
             # iter_data.set_description(f"Epoch {itr}, Loss: {current_loss:.5f}")
             try:
-                with torch.autograd.set_detect_anomaly(True):
+                with torch.autograd.set_detect_anomaly(args.detect_anomaly):
                     if args.use_amp:
                         with autocast():
                             train_res = compute_all_losses(
@@ -1158,8 +1191,26 @@ def trainable(
 
             except (RuntimeError, AssertionError) as e:
                 if isinstance(e, RuntimeError) and "out of memory" in str(e).lower():
-                    print(f"[OOM] Step {step}: Skipping batch due to out-of-memory.")
-                    torch.cuda.empty_cache()
+                    print(
+                        f"[OOM] Epoch {itr}, step {step}: "
+                        "skipping this batch due to out-of-memory."
+                    )
+                    notes = batch_dict.get("notes_embeddings")
+                    if torch.is_tensor(notes):
+                        print(f"[OOM] notes_embeddings shape: {tuple(notes.shape)}")
+                    print(
+                        "[OOM] observed_data shape: "
+                        f"{tuple(batch_dict['observed_data'].shape)}"
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    if torch.cuda.is_available():
+                        allocated = torch.cuda.memory_allocated() / (1024 ** 2)
+                        reserved = torch.cuda.memory_reserved() / (1024 ** 2)
+                        print(
+                            f"[OOM] CUDA allocated/reserved: "
+                            f"{allocated:.1f}/{reserved:.1f} MiB"
+                        )
+                        torch.cuda.empty_cache()
                 elif isinstance(
                     e, AssertionError
                 ) and "t must be strictly increasing or decreasing" in str(e):
@@ -1346,3 +1397,4 @@ if __name__ == "__main__":
     best_metrics = trainable(tunable_params, fixed_params, args)
     print_formatted_dict(best_metrics)
     print("### Done ###")
+

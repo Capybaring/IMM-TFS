@@ -10,14 +10,14 @@ set -euo pipefail
 TRAIN_N=1000
 ENABLE_TEXT=0
 SWEEP=0
-SWEEP_SIZES_CSV="200,500"
+SWEEP_SIZES_CSV="1000,2000,4000,6000,8000"
 SWEEP_MODES="both"
 OUTPUT_DIR=""
 GPU=0
 EPOCHS=50
 BATCH_SIZE=32
-PATIENCE=10
-MODEL_SEED=3
+PATIENCE=5
+MODEL_SEED=1
 LOADER_SEED=314159
 
 DATASET="MIMIC"
@@ -40,6 +40,12 @@ DROPOUT=0.3
 TEXT_HEADS=1
 TEXT_GATE_BIAS=-1.0
 
+TTF_MODULE="TTF_T2V_XAttn"
+MMF_MODULE="MMF_XAttn_Add"
+SEMANTIC_SLOTS=4
+RECENCY_SIGMA=1.0
+SEMANTIC_TIME_GATE_BIAS=-1.0
+
 usage() {
 cat <<'EOF'
 Usage:
@@ -59,8 +65,14 @@ Options:
   --gpu ID              GPU id for main.py (default: 0)
   --seed N              Model/training seed (default: 1)
   --loader-seed N       Fixed DataLoader shuffle seed (default: 314159)
-  --text-heads N        Heads for MTGNN variable-to-report attention (default: 1)
-  --text-gate-bias X    Initial internal text-gate bias (default: -1.0)
+  --text-heads N        Attention heads used by fusion modules (default: 1)
+  --text-gate-bias X    Legacy GPINet internal text-gate bias (default: -1.0)
+  --TTF_module NAME      TTF module passed to main.py (default: TTF_T2V_XAttn)
+  --MMF_module NAME      MMF module passed to main.py (default: MMF_XAttn_Add)
+  --semantic_slots N     Semantic slots for TTF_SemTime_Slots (default: 4)
+  --recency_sigma X      Gaussian recency sigma on normalized time (default: 1.0)
+  --semantic_time_gate_bias X
+                        Initial adaptive time-gate bias (default: -1.0)
   -h, --help            Show this help
 
 Examples:
@@ -71,6 +83,11 @@ Examples:
   ./scripts/run_gpinet_fixed.sh --sweep --modes text --sizes 1000,2000,4000,6000,8000
   ./scripts/run_gpinet_fixed.sh -n 1000 --epochs 50 --patience 10
   ./scripts/run_gpinet_fixed.sh -n 1000 --text --epochs 50 --patience 10
+  ./scripts/run_gpinet_fixed.sh -n 1000 --text \
+    --TTF_module TTF_SemTime_Slots \
+    --semantic_slots 4 \
+    --recency_sigma 0.25 \
+    --semantic_time_gate_bias -1.0
 
 Sweep outputs:
   <output-dir>/final_metrics.log                  readable MSE/MAE summary
@@ -106,12 +123,24 @@ while [[ $# -gt 0 ]]; do
         --loader-seed) LOADER_SEED="$2"; shift 2 ;;
         --text-heads) TEXT_HEADS="$2"; shift 2 ;;
         --text-gate-bias) TEXT_GATE_BIAS="$2"; shift 2 ;;
+        --TTF_module|--ttf-module) TTF_MODULE="$2"; shift 2 ;;
+        --MMF_module|--mmf-module) MMF_MODULE="$2"; shift 2 ;;
+        --semantic_slots|--semantic-slots) SEMANTIC_SLOTS="$2"; shift 2 ;;
+        --recency_sigma|--recency-sigma) RECENCY_SIGMA="$2"; shift 2 ;;
+        --semantic_time_gate_bias|--semantic-time-gate-bias)
+            SEMANTIC_TIME_GATE_BIAS="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; usage >&2; exit 1 ;;
     esac
 done
 
-for pair in "TRAIN_N:$TRAIN_N" "EPOCHS:$EPOCHS" "BATCH_SIZE:$BATCH_SIZE" "PATIENCE:$PATIENCE" "TEXT_HEADS:$TEXT_HEADS"; do
+for pair in \
+    "TRAIN_N:$TRAIN_N" \
+    "EPOCHS:$EPOCHS" \
+    "BATCH_SIZE:$BATCH_SIZE" \
+    "PATIENCE:$PATIENCE" \
+    "TEXT_HEADS:$TEXT_HEADS" \
+    "SEMANTIC_SLOTS:$SEMANTIC_SLOTS"; do
     name="${pair%%:*}"; value="${pair#*:}"
     if ! [[ "$value" =~ ^[0-9]+$ ]] || [[ "$value" -le 0 ]]; then
         echo "Error: $name must be a positive integer, got $value" >&2
@@ -164,6 +193,11 @@ if [[ "$SWEEP" -eq 1 ]]; then
         echo "modes            : $SWEEP_MODES"
         echo "model_seed       : $MODEL_SEED"
         echo "loader_seed      : $LOADER_SEED"
+        echo "TTF module       : $TTF_MODULE"
+        echo "MMF module       : $MMF_MODULE"
+        echo "semantic slots   : $SEMANTIC_SLOTS"
+        echo "recency sigma    : $RECENCY_SIGMA"
+        echo "time gate bias   : $SEMANTIC_TIME_GATE_BIAS"
         echo "epochs/patience  : $EPOCHS/$PATIENCE"
         echo "batch_size       : $BATCH_SIZE"
         echo "output_directory : $OUTPUT_DIR"
@@ -197,6 +231,11 @@ if [[ "$SWEEP" -eq 1 ]]; then
                 --loader-seed "$LOADER_SEED"
                 --text-heads "$TEXT_HEADS"
                 --text-gate-bias "$TEXT_GATE_BIAS"
+                --TTF_module "$TTF_MODULE"
+                --MMF_module "$MMF_MODULE"
+                --semantic_slots "$SEMANTIC_SLOTS"
+                --recency_sigma "$RECENCY_SIGMA"
+                --semantic_time_gate_bias "$SEMANTIC_TIME_GATE_BIAS"
             )
             if [[ "$text_flag" -eq 1 ]]; then
                 RUN_CMD+=(--text)
@@ -330,8 +369,12 @@ echo "epochs / patience     : $EPOCHS / $PATIENCE"
 echo "batch size            : $BATCH_SIZE"
 echo "normalization         : fixed FULL-TRAIN HISTORY"
 if [[ "$ENABLE_TEXT" -eq 1 ]]; then
-    echo "text fusion           : variable-to-report attention inside MTGNN"
-    echo "text heads / gate bias: $TEXT_HEADS / $TEXT_GATE_BIAS"
+    echo "TTF / MMF             : $TTF_MODULE / $MMF_MODULE"
+    echo "fusion heads          : $TEXT_HEADS"
+    echo "semantic slots        : $SEMANTIC_SLOTS"
+    echo "recency sigma         : $RECENCY_SIGMA"
+    echo "semantic time bias    : $SEMANTIC_TIME_GATE_BIAS"
+    echo "legacy GP gate bias   : $TEXT_GATE_BIAS"
 fi
 echo "=================================================================="
 
@@ -423,8 +466,18 @@ if [[ "$ENABLE_TEXT" -eq 1 ]]; then
         --max_length "$MAX_LENGTH"
         --n_heads_fusion "$TEXT_HEADS"
         --gpinet_text_gate_bias "$TEXT_GATE_BIAS"
+        --TTF_module "$TTF_MODULE"
+        --MMF_module "$MMF_MODULE"
+        --semantic_slots "$SEMANTIC_SLOTS"
+        --recency_sigma "$RECENCY_SIGMA"
+        --semantic_time_gate_bias "$SEMANTIC_TIME_GATE_BIAS"
     )
 fi
+
+echo
+printf "### Command:"
+printf " %q" "${CMD[@]}"
+echo
 
 "${CMD[@]}"
 
