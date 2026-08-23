@@ -10,14 +10,14 @@ set -euo pipefail
 TRAIN_N=1000
 ENABLE_TEXT=0
 SWEEP=0
-SWEEP_SIZES_CSV="1000,2000,4000"
+SWEEP_SIZES_CSV="200,500"
 SWEEP_MODES="both"
 OUTPUT_DIR=""
 GPU=0
 EPOCHS=50
 BATCH_SIZE=32
 PATIENCE=10
-MODEL_SEED=1
+MODEL_SEED=3
 LOADER_SEED=314159
 
 DATASET="MIMIC"
@@ -49,8 +49,8 @@ Usage:
 Options:
   -n, --num N           Number of TRAIN subjects (default: 1000)
   --text                Enable BERT/radiology multimodal run
-  --sweep               Run the fixed 1000/2000/4000 Uni+Multi experiment set
-  --sizes CSV           Sweep sizes (default: 1000,2000,4000)
+  --sweep               Run the fixed 1000/2000/4000/6000/8000 Uni+Multi experiment set
+  --sizes CSV           Sweep sizes (default: 1000,2000,4000,6000,8000)
   --modes MODE          Sweep modes: both, uni, or text (default: both)
   --output-dir DIR      Sweep log directory (default: timestamped directory)
   --epochs N            Epochs (default: 50)
@@ -68,7 +68,7 @@ Examples:
   ./scripts/run_gpinet_fixed.sh -n 1000 --text
   ./scripts/run_gpinet_fixed.sh --sweep
   ./scripts/run_gpinet_fixed.sh --sweep --epochs 50 --patience 10
-  ./scripts/run_gpinet_fixed.sh --sweep --modes text --sizes 1000,2000,4000
+  ./scripts/run_gpinet_fixed.sh --sweep --modes text --sizes 1000,2000,4000,6000,8000
   ./scripts/run_gpinet_fixed.sh -n 1000 --epochs 50 --patience 10
   ./scripts/run_gpinet_fixed.sh -n 1000 --text --epochs 50 --patience 10
 
