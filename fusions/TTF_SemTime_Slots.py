@@ -8,16 +8,16 @@ from fusions.load_llm import embed_notes, get_d_model, load_llm
 
 
 class TTF_SemTime_Slots(nn.Module):
-    """Semantic-slot text aggregation with adaptive temporal decay.
+    """Competitive semantic-slot aggregation with adaptive recency.
 
-    The public interface matches the existing TTF modules:
+    Compared with independent ``softmax-over-notes`` slots, every real note is
+    first assigned *across slots*.  This creates actual competition between
+    slots and makes ``slot_mass`` meaningful.  Each slot then aggregates its
+    assigned notes over future time without a global projection that would mix
+    slot boundaries before MMF selection.
 
+    Public interface:
         E_txt, M_txt = module(notes_input, tau, t_hat)
-
-    Each learned slot can specialize to a latent clinical topic.  Temporal
-    decay is activated according to the semantic disagreement among the notes
-    read by that slot.  Similar notes therefore receive little temporal bias,
-    while changing descriptions inside one topic favour more recent reports.
     """
 
     def __init__(
@@ -33,14 +33,17 @@ class TTF_SemTime_Slots(nn.Module):
         semantic_slots: int = 4,
         recency_sigma: float = 1.0,
         time_gate_bias: float = -1.0,
+        assignment_temperature: float = 0.7,
     ):
         super().__init__()
-        del n_heads_fusion  # Kept for constructor compatibility with FusionModel.
+        del n_heads_fusion
 
         if semantic_slots < 1:
             raise ValueError("semantic_slots must be >= 1")
         if recency_sigma <= 0:
             raise ValueError("recency_sigma must be > 0")
+        if assignment_temperature <= 0:
+            raise ValueError("assignment_temperature must be > 0")
 
         self.use_text_embeddings = use_text_embeddings
         if not use_text_embeddings:
@@ -57,15 +60,17 @@ class TTF_SemTime_Slots(nn.Module):
                 f"semantic_slots={self.semantic_slots}"
             )
         self.slot_dim = self.d_txt // self.semantic_slots
-        self.max_length = max_length
+        self.max_length = int(max_length)
+        self.assignment_temperature = float(assignment_temperature)
 
         self.input_proj = (
-            nn.Linear(d_model, self.d_txt) if d_model != self.d_txt else nn.Identity()
+            nn.Linear(d_model, self.d_txt)
+            if d_model != self.d_txt
+            else nn.Identity()
         )
         self.key_proj = nn.Linear(self.d_txt, self.d_txt, bias=False)
         self.value_proj = nn.Linear(self.d_txt, self.d_txt, bias=False)
         self.consistency_proj = nn.Linear(self.d_txt, self.d_txt, bias=False)
-        self.note_score = nn.Linear(self.d_txt, 1, bias=False)
 
         self.slot_queries = nn.Parameter(
             torch.randn(self.semantic_slots, self.slot_dim) * 0.02
@@ -78,9 +83,6 @@ class TTF_SemTime_Slots(nn.Module):
             )
         )
 
-        # The disagreement factor below already forces the gate to zero when
-        # notes are semantically identical.  This MLP learns how strongly the
-        # remaining disagreement should activate temporal decay.
         self.time_gate = nn.Sequential(
             nn.Linear(3, self.semantic_slots),
             nn.GELU(),
@@ -88,16 +90,13 @@ class TTF_SemTime_Slots(nn.Module):
         )
         nn.init.constant_(self.time_gate[-1].bias, float(time_gate_bias))
 
-        # Keep slot boundaries explicit for MMF_VarTime_SlotGate.  A global
-        # d_txt -> d_txt projection would mix dimensions from different slots
-        # before MMF has a chance to select them.
         self.slot_output_norm = nn.LayerNorm(self.slot_dim)
         self.slot_output_proj = nn.Linear(self.slot_dim, self.slot_dim)
         self.dropout = nn.Dropout(dropout)
 
-        # Optional diagnostics; populated during forward without changing the
-        # existing two-value TTF return signature.
+        self.last_slot_assignment = None
         self.last_semantic_weights = None
+        self.last_slot_mass = None
         self.last_slot_consistency = None
         self.last_time_gate = None
         self.last_fused_weights = None
@@ -111,7 +110,6 @@ class TTF_SemTime_Slots(nn.Module):
         return weights / weights.sum(dim=dim, keepdim=True).clamp_min(1e-8)
 
     def _slot_consistency(self, semantic_weights, semantic_vectors, note_mask):
-        """Weighted off-diagonal cosine agreement for each semantic slot."""
         normalized = F.normalize(semantic_vectors, p=2, dim=-1, eps=1e-8)
         pairwise = torch.einsum("bkd,bjd->bkj", normalized, normalized)
 
@@ -131,8 +129,6 @@ class TTF_SemTime_Slots(nn.Module):
             pair_weights * pairwise[:, None] * valid_pairs[:, None]
         ).sum(dim=(-1, -2))
 
-        # With zero or one valid note, time weighting cannot change a normalized
-        # aggregation, so treating the slot as fully consistent is appropriate.
         consistency = torch.where(
             denom > 1e-8,
             numer / denom.clamp_min(1e-8),
@@ -154,17 +150,15 @@ class TTF_SemTime_Slots(nn.Module):
 
         if V.ndim != 3:
             raise ValueError(
-                "notes_input must produce a tensor shaped (B, K, d_model), "
+                "notes_input must produce (B, K, d_model), "
                 f"got {tuple(V.shape)}"
             )
-        if torch.isnan(V).any():
-            raise ValueError("Input embeddings V contain NaN values.")
+        if not torch.isfinite(V).all():
+            raise ValueError("Input text embeddings contain NaN or Inf values")
 
         B, K, _ = V.shape
         if tau.ndim != 2 or tau.shape != (B, K):
-            raise ValueError(
-                f"Expected tau shape {(B, K)}, got {tuple(tau.shape)}"
-            )
+            raise ValueError(f"Expected tau shape {(B, K)}, got {tuple(tau.shape)}")
         if t_hat.dim() == 1:
             t_hat = t_hat.unsqueeze(0).expand(B, -1)
         elif t_hat.ndim != 2 or t_hat.shape[0] != B:
@@ -172,32 +166,43 @@ class TTF_SemTime_Slots(nn.Module):
                 f"Expected t_hat shape (B, T_f) or (T_f,), got {tuple(t_hat.shape)}"
             )
 
+        tau = tau.to(device=V.device, dtype=V.dtype)
+        t_hat = t_hat.to(device=V.device, dtype=V.dtype)
+
         T_f = t_hat.shape[1]
         M_txt = note_mask.any(dim=1, keepdim=True)
         if K == 0:
-            E_txt = V.new_zeros((B, T_f, self.d_txt))
-            return E_txt, M_txt
+            return V.new_zeros((B, T_f, self.d_txt)), M_txt
 
         V = self.input_proj(V)
         V = V * note_mask.unsqueeze(-1).to(V.dtype)
 
-        keys = self.key_proj(V).view(
+        keys = self.key_proj(V).reshape(
             B, K, self.semantic_slots, self.slot_dim
         )
-        values = self.value_proj(V).view(
+        values = self.value_proj(V).reshape(
             B, K, self.semantic_slots, self.slot_dim
         ).permute(0, 2, 1, 3)
 
-        semantic_logits = torch.einsum(
+        # (B, H, K): compatibility between slot h and note k.
+        slot_logits = torch.einsum(
             "hd,bkhd->bhk", self.slot_queries, keys
         ) / math.sqrt(self.slot_dim)
-        semantic_logits = semantic_logits + self.note_score(V).squeeze(-1)[:, None]
 
-        semantic_mask = note_mask[:, None, :].expand(
-            B, self.semantic_slots, K
+        # Crucial change: normalize across H for each note.  Notes now choose
+        # slots instead of every slot independently choosing the same notes.
+        slot_assignment = torch.softmax(
+            slot_logits / self.assignment_temperature, dim=1
         )
-        semantic_weights = self._masked_softmax(
-            semantic_logits, semantic_mask, dim=-1
+        slot_assignment = slot_assignment * note_mask[:, None, :].to(V.dtype)
+
+        raw_slot_mass = slot_assignment.sum(dim=-1)
+        valid_count = note_mask.sum(dim=-1, keepdim=True).to(V.dtype)
+        slot_mass = raw_slot_mass / valid_count.clamp_min(1.0)
+
+        # Within each slot, normalize only over its assigned real notes.
+        semantic_weights = slot_assignment / raw_slot_mass.unsqueeze(-1).clamp_min(
+            1e-8
         )
 
         consistency_vectors = self.consistency_proj(V)
@@ -207,10 +212,8 @@ class TTF_SemTime_Slots(nn.Module):
         disagreement = 1.0 - consistency
 
         entropy = -(
-            semantic_weights
-            * semantic_weights.clamp_min(1e-8).log()
+            semantic_weights * semantic_weights.clamp_min(1e-8).log()
         ).sum(dim=-1)
-        valid_count = note_mask.sum(dim=-1, keepdim=True).to(V.dtype)
         entropy_scale = valid_count.clamp_min(2.0).log()
         entropy = torch.where(
             valid_count > 1,
@@ -218,7 +221,6 @@ class TTF_SemTime_Slots(nn.Module):
             torch.zeros_like(entropy),
         )
 
-        slot_mass = semantic_weights.sum(dim=-1).clamp(0.0, 1.0)
         gate_features = torch.stack(
             [consistency, disagreement, entropy], dim=-1
         )
@@ -231,16 +233,17 @@ class TTF_SemTime_Slots(nn.Module):
             delta[:, None, :, :] / sigma[None, :, None, None]
         ).square()
 
+        # log assignment retains cross-slot competition while softmax over K
+        # creates a valid note distribution for each slot and future time.
+        base_logits = slot_assignment.clamp_min(1e-8).log()
         fused_logits = (
-            semantic_logits[:, :, None, :]
+            base_logits[:, :, None, :]
             + time_gate[:, :, None, None] * time_logits
         )
         fused_mask = note_mask[:, None, None, :].expand(
             B, self.semantic_slots, T_f, K
         )
-        fused_weights = self._masked_softmax(
-            fused_logits, fused_mask, dim=-1
-        )
+        fused_weights = self._masked_softmax(fused_logits, fused_mask, dim=-1)
 
         slot_outputs = torch.einsum(
             "bhtk,bhkd->bhtd", fused_weights, values
@@ -248,12 +251,19 @@ class TTF_SemTime_Slots(nn.Module):
         slot_outputs = self.slot_output_proj(
             self.dropout(self.slot_output_norm(slot_outputs))
         )
-        E_txt = slot_outputs.permute(0, 2, 1, 3).reshape(
-            B, T_f, self.d_txt
-        )
+
+        # Suppress nearly unused slots but keep a balanced H-way assignment at
+        # unit scale.  This factor is meaningful because slot_mass is no longer
+        # identically one.
+        slot_strength = (slot_mass * self.semantic_slots).clamp(0.0, 1.0)
+        slot_outputs = slot_outputs * slot_strength[:, :, None, None]
+
+        E_txt = slot_outputs.permute(0, 2, 1, 3).reshape(B, T_f, self.d_txt)
         E_txt = E_txt * M_txt[:, :, None].to(E_txt.dtype)
 
+        self.last_slot_assignment = slot_assignment.detach()
         self.last_semantic_weights = semantic_weights.detach()
+        self.last_slot_mass = slot_mass.detach()
         self.last_slot_consistency = consistency.detach()
         self.last_time_gate = time_gate.detach()
         self.last_fused_weights = fused_weights.detach()

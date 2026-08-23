@@ -42,8 +42,8 @@ NODE_DIM=10
 HID_DIM=64
 DROPOUT=0.3
 
-TTF_MODULE="TTF_T2V_XAttn"
-MMF_MODULE="MMF_XAttn_Add"
+TTF_MODULE="TTF_SemTime_Slots"
+MMF_MODULE="MMF_VarTime_SlotGate"
 
 usage() {
     cat <<'EOF'
@@ -60,7 +60,7 @@ Main options:
   --seed N              Random seed passed to main.py (default: 1)
 
 Examples:
-  ./scripts/run_gpinet_n.sh -n 200
+  ./scripts/run_gpinet_n.sh -n 1000
   ./scripts/run_gpinet_n.sh -n 2000
   ./scripts/run_gpinet_n.sh -n 2000 --text
   ./scripts/run_gpinet_n.sh -n 5000 --epochs 50
