@@ -16,11 +16,11 @@ fi
 exec bash "$BASE_RUNNER" \
     --TTF_module TTF_SemTime_Slots \
     --MMF_module MMF_VarTime_SlotGate \
-    --semantic_slots 2 \
+    --semantic_slots 1 \
     --recency_sigma 0.25 \
     --semantic_time_gate_bias -2.0 \
     --mmf_slot_attn_dim 128 \
-    --mmf_slot_gate_bias -3.0 \
+    --mmf_slot_gate_bias -2.0 \
     --kappa 0.1 \
     --batch-size 16 \
     "$@"

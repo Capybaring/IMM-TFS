@@ -39,7 +39,7 @@ def compute_error(truth, pred_y, mask, func, reduce, norm_dict=None):
     elif func == "MAPE":
         if norm_dict is None:
             valid_mask = (truth_repeated != 0) * mask
-            denominator = truth_repeated + (truth_repeated == 0) * 1e-8
+            denominator = truth_repeated.abs().clamp_min(1e-8)
             error = torch.abs(truth_repeated - pred_y) / denominator * valid_mask
             mask = valid_mask
         else:
@@ -48,7 +48,7 @@ def compute_error(truth, pred_y, mask, func, reduce, norm_dict=None):
             truth_rescale = truth_repeated * (data_max - data_min) + data_min
             pred_rescale = pred_y * (data_max - data_min) + data_min
             valid_mask = (truth_rescale != 0) * mask
-            denominator = truth_rescale + (truth_rescale == 0) * 1e-8
+            denominator = truth_rescale.abs().clamp_min(1e-8)
             error = torch.abs(truth_rescale - pred_rescale) / denominator * valid_mask
             mask = valid_mask
     else:
@@ -149,11 +149,18 @@ def _collect_fusion_diagnostics(fusion, mask, diag_sum, diag_count):
     if mmf is not None:
         null_prob = getattr(mmf, "last_null_probability", None)
         gate = getattr(mmf, "last_gate", None)
+        variable_relevance = getattr(mmf, "last_variable_relevance", None)
         correction = getattr(mmf, "last_correction", None)
         attention = getattr(mmf, "last_slot_attention", None)
 
         _add_diag(diag_sum, diag_count, "text_null_probability_mean", null_prob)
         _add_diag(diag_sum, diag_count, "text_gate_mean", gate)
+        _add_diag(
+            diag_sum,
+            diag_count,
+            "text_variable_relevance_mean",
+            variable_relevance,
+        )
         if correction is not None:
             _add_diag(
                 diag_sum,
@@ -241,6 +248,7 @@ def evaluation(
     base_se_sum = base_ae_sum = None
     mask_count = mask_count_mape = None
     correction_abs_sum = correction_signed_sum = None
+    relevance_sum = gate_sum = null_probability_sum = None
     diag_sum = {}
     diag_count = {}
 
@@ -292,12 +300,27 @@ def evaluation(
                 base_ae_sum = torch.zeros_like(base_ae)
                 correction_abs_sum = torch.zeros_like(base_se)
                 correction_signed_sum = torch.zeros_like(base_se)
+                relevance_sum = torch.zeros_like(base_se)
+                gate_sum = torch.zeros_like(base_se)
+                null_probability_sum = torch.zeros_like(base_se)
             base_se_sum += base_se
             base_ae_sum += base_ae
 
             correction = pred_y - base_pred
             correction_abs_sum += (correction.abs() * mask).sum(dim=(0, 1))
             correction_signed_sum += (correction * mask).sum(dim=(0, 1))
+
+            mmf = getattr(fusion, "mmf", None)
+            if mmf is not None:
+                relevance = getattr(mmf, "last_variable_relevance", None)
+                gate_value = getattr(mmf, "last_gate", None)
+                null_value = getattr(mmf, "last_null_probability", None)
+                if relevance is not None:
+                    relevance_sum += (relevance * mask).sum(dim=(0, 1))
+                if gate_value is not None:
+                    gate_sum += (gate_value * mask).sum(dim=(0, 1))
+                if null_value is not None:
+                    null_probability_sum += (null_value * mask).sum(dim=(0, 1))
             _collect_fusion_diagnostics(
                 fusion, mask, diag_sum, diag_count
             )
@@ -335,6 +358,11 @@ def evaluation(
         base_mae = base_mae_var[available].mean()
         correction_abs_var = correction_abs_sum / mask_count.clamp_min(1e-8)
         correction_signed_var = correction_signed_sum / mask_count.clamp_min(1e-8)
+        relevance_var = relevance_sum / mask_count.clamp_min(1e-8)
+        gate_var = gate_sum / mask_count.clamp_min(1e-8)
+        null_probability_var = (
+            null_probability_sum / mask_count.clamp_min(1e-8)
+        )
 
         results.update(
             {
@@ -355,6 +383,13 @@ def evaluation(
                 ),
                 "correction_signed_per_variable": _to_named_dict(
                     names, correction_signed_var
+                ),
+                "text_relevance_per_variable": _to_named_dict(
+                    names, relevance_var
+                ),
+                "text_gate_per_variable": _to_named_dict(names, gate_var),
+                "text_null_probability_per_variable": _to_named_dict(
+                    names, null_probability_var
                 ),
             }
         )

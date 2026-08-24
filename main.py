@@ -1093,12 +1093,66 @@ def trainable(
     logger.info(input_command)
     logger.info(args)
 
-    # Set trainable_parameters
-    trainable_parameters = list(model.parameters())
-    if fusion is not None:
-        trainable_parameters += list(fusion.parameters())
+    # Keep the numerical backbone's original regularization, but do not apply
+    # weight decay to the sparse-text fusion branch.  Otherwise its already
+    # weak residual gradient can be pulled back toward zero.
+    model_parameters = list(model.parameters())
+    fusion_parameters = list(fusion.parameters()) if fusion is not None else []
+    trainable_parameters = model_parameters + fusion_parameters
+    if fusion_parameters:
+        optimizer = optim.Adam(
+            [
+                {
+                    "params": model_parameters,
+                    "weight_decay": args.w_decay,
+                },
+                {
+                    "params": fusion_parameters,
+                    "weight_decay": 0.0,
+                },
+            ],
+            lr=args.lr,
+        )
+    else:
+        optimizer = optim.Adam(
+            model_parameters,
+            lr=args.lr,
+            weight_decay=args.w_decay,
+        )
 
-    optimizer = optim.Adam(trainable_parameters, lr=args.lr, weight_decay=args.w_decay)
+    def _clip_training_gradients():
+        # Clip the large GPINet and small fusion branch independently.  Joint
+        # clipping can suppress the fusion gradient when the backbone norm is
+        # much larger.
+        torch.nn.utils.clip_grad_norm_(model_parameters, max_norm=1.0)
+        if fusion_parameters:
+            torch.nn.utils.clip_grad_norm_(fusion_parameters, max_norm=1.0)
+
+    def _log_fusion_bootstrap(epoch, step, batch_dict):
+        if fusion is None or epoch != 0 or step >= 3:
+            return
+        mmf = getattr(fusion, "mmf", None)
+        delta_out = getattr(mmf, "delta_out", None)
+        if delta_out is None:
+            return
+        grad = delta_out.weight.grad
+        grad_mean = 0.0 if grad is None else grad.detach().abs().mean().item()
+        grad_max = 0.0 if grad is None else grad.detach().abs().max().item()
+        weight_norm = delta_out.weight.detach().norm().item()
+        notes = batch_dict.get("notes_embeddings")
+        text_samples = total_samples = real_notes = -1
+        if torch.is_tensor(notes) and notes.ndim == 3:
+            note_mask = notes.detach().abs().sum(dim=-1) > 0
+            text_samples = int(note_mask.any(dim=-1).sum().item())
+            total_samples = int(note_mask.shape[0])
+            real_notes = int(note_mask.sum().item())
+        print(
+            f"[FusionBootstrap] epoch={epoch} step={step} "
+            f"text_samples={text_samples}/{total_samples} "
+            f"real_notes={real_notes} delta_grad_mean={grad_mean:.3e} "
+            f"delta_grad_max={grad_max:.3e} "
+            f"delta_weight_norm={weight_norm:.3e}"
+        )
 
     def _nan_hook(module, inputs, output, name):
         # output might be a Tensor or tuple of Tensors
@@ -1165,9 +1219,10 @@ def trainable(
                             )
                             loss = train_res["loss"]
                         scaler.scale(loss).backward()
-                        torch.nn.utils.clip_grad_norm_(
-                            trainable_parameters, max_norm=1.0
-                        )
+                        # AMP gradients must be unscaled before clipping.
+                        scaler.unscale_(optimizer)
+                        _log_fusion_bootstrap(itr, step, batch_dict)
+                        _clip_training_gradients()
                         scaler.step(optimizer)
                         scaler.update()
                     else:
@@ -1180,9 +1235,8 @@ def trainable(
                         )
                         loss = train_res["loss"]
                         loss.backward()
-                        torch.nn.utils.clip_grad_norm_(
-                            trainable_parameters, max_norm=1.0
-                        )
+                        _log_fusion_bootstrap(itr, step, batch_dict)
+                        _clip_training_gradients()
                         optimizer.step()
 
                     # Update the progress bar description with current loss
@@ -1397,4 +1451,3 @@ if __name__ == "__main__":
     best_metrics = trainable(tunable_params, fixed_params, args)
     print_formatted_dict(best_metrics)
     print("### Done ###")
-

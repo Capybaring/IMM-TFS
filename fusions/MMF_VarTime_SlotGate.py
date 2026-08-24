@@ -1,3 +1,4 @@
+# BUILD_ID: no-null-variable-gate-v4-20260823
 import math
 
 import torch
@@ -19,12 +20,13 @@ class FutureTime2Vec(nn.Module):
 
 
 class MMF_VarTime_SlotGate(nn.Module):
-    """Conservative variable-time residual fusion over semantic text slots.
+    """Variable-time residual fusion over semantic text slots.
 
-    The final delta layer is zero-initialized, NULL has an explicit prior, and
-    the post-attention context is not layer-normalized.  Therefore the initial
-    forward is exactly ``Y_out == Y_ts`` and selecting NULL really suppresses
-    the text residual.
+    The final delta layer is initialized with a very small non-zero weight,
+    and the post-attention context is not layer-normalized.  Real-slot
+    attention selects text content; the variable-time relevance gate is the
+    only learned text rejection mechanism.  This avoids a learnable NULL token
+    collapsing to probability one before the sparse-text branch can learn.
 
     Shapes:
         Y_ts:  (B, T, C)
@@ -73,6 +75,9 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.n_heads = int(n_heads_fusion)
         self.head_dim = self.d_attn // self.n_heads
         self.kappa = float(kappa)
+        # Retained only for constructor compatibility with older runners and
+        # checkpoints.  NULL no longer participates in attention or gating.
+        del null_logit_bias
 
         self.local_value_proj = nn.Linear(1, self.d_attn, bias=False)
         self.global_state_proj = nn.Linear(self.C, self.d_attn, bias=False)
@@ -84,15 +89,11 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.time_proj = nn.Linear(d_time, self.d_attn, bias=False)
         self.query_norm = nn.LayerNorm(self.d_attn)
 
-        # Normalize real slots before attention.  The weighted context is not
-        # normalized afterwards, so NULL probability still controls magnitude.
+        # Normalize real slots before attention.  Do not normalize the weighted
+        # context afterwards, so its magnitude remains available to the gate.
         self.slot_norm = nn.LayerNorm(self.slot_dim)
         self.slot_key = nn.Linear(self.slot_dim, self.d_attn, bias=False)
         self.slot_value = nn.Linear(self.slot_dim, self.d_attn, bias=False)
-        self.null_key = nn.Parameter(torch.randn(1, self.d_attn) * 0.02)
-        self.null_logit_bias = nn.Parameter(
-            torch.tensor(float(null_logit_bias), dtype=torch.float32)
-        )
 
         self.gate_net = nn.Sequential(
             nn.Linear(4 * self.d_attn, self.d_attn),
@@ -109,7 +110,7 @@ class MMF_VarTime_SlotGate(nn.Module):
             nn.Dropout(dropout),
         )
         self.delta_out = nn.Linear(self.d_attn, 1, bias=False)
-        nn.init.zeros_(self.delta_out.weight)
+        nn.init.normal_(self.delta_out.weight, mean=0.0, std=1e-3)
 
         # Additive variable-specific relevance logit.  It is shared over future
         # time but combined with a time-specific query gate below.  This is the
@@ -198,30 +199,19 @@ class MMF_VarTime_SlotGate(nn.Module):
 
         real_keys = self.slot_key(E_slots)
         real_values = self.slot_value(E_slots)
-        null_keys = self.null_key.view(1, 1, 1, self.d_attn).expand(B, T, 1, -1)
-        null_values = torch.zeros_like(null_keys)
-        all_keys = torch.cat([real_keys, null_keys], dim=2)
-        all_values = torch.cat([real_values, null_values], dim=2)
 
-        slot_count = self.semantic_slots + 1
+        slot_count = self.semantic_slots
         q_heads = query.reshape(B, T, C, self.n_heads, self.head_dim)
-        k_heads = all_keys.reshape(
+        k_heads = real_keys.reshape(
             B, T, slot_count, self.n_heads, self.head_dim
         )
-        v_heads = all_values.reshape(
+        v_heads = real_values.reshape(
             B, T, slot_count, self.n_heads, self.head_dim
         )
 
         scores = torch.einsum(
             "btchd,btshd->btchs", q_heads, k_heads
         ) / math.sqrt(self.head_dim)
-        score_bias = torch.cat(
-            [
-                scores.new_zeros(self.semantic_slots),
-                self.null_logit_bias.to(scores.dtype).reshape(1),
-            ]
-        )
-        scores = scores + score_bias.view(1, 1, 1, 1, slot_count)
         attention = torch.softmax(scores, dim=-1)
 
         context_heads = torch.einsum(
@@ -229,8 +219,9 @@ class MMF_VarTime_SlotGate(nn.Module):
         )
         context = context_heads.reshape(B, T, C, self.d_attn)
 
-        null_probability = attention[..., -1].mean(dim=-1)
-        real_mass = (1.0 - null_probability).clamp(0.0, 1.0)
+        # Kept as an all-zero diagnostic for compatibility with the existing
+        # evaluation output.  It is not part of the forward computation.
+        null_probability = Y_ts.new_zeros(B, T, C)
 
         interaction = torch.cat(
             [query, context, query * context, torch.abs(query - context)],
@@ -240,20 +231,28 @@ class MMF_VarTime_SlotGate(nn.Module):
         gate_logits = gate_logits + self.variable_gate_logit.view(1, 1, C)
         variable_relevance = torch.sigmoid(gate_logits)
 
-        # real_mass comes directly from competition between text and NULL.
-        # Keep it linear: with only one or two reports, squaring it can make the
-        # learning signal too small for the relevance gate to ever open.
-        gate = variable_relevance * real_mass * text_mask
+        # The variable-time gate is now the sole learned rejection mechanism.
+        # text_mask still guarantees exact identity when a sample has no text.
+        gate = variable_relevance * text_mask
 
         delta_features = torch.cat([context, query * context], dim=-1)
         delta_text = torch.tanh(
             self.delta_out(self.delta_hidden(delta_features)).squeeze(-1)
         )
 
-        correction = self.kappa * gate * delta_text * text_mask
+        correction = self.kappa * gate * delta_text
         Y_out = Y_ts + correction
 
-        self.last_slot_attention = attention.mean(dim=-2).detach()
+        # Preserve the old H+1 diagnostic shape by appending a zero-probability
+        # NULL column.  This keeps evaluation entropy code valid when H == 1.
+        diagnostic_attention = torch.cat(
+            [
+                attention.mean(dim=-2),
+                null_probability.unsqueeze(-1),
+            ],
+            dim=-1,
+        )
+        self.last_slot_attention = diagnostic_attention.detach()
         self.last_null_probability = null_probability.detach()
         self.last_gate = gate.detach()
         self.last_variable_relevance = variable_relevance.detach()

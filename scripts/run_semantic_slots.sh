@@ -15,7 +15,7 @@ SWEEP_MODES="both"
 OUTPUT_DIR=""
 GPU=0
 EPOCHS=50
-BATCH_SIZE=32
+BATCH_SIZE=16
 PATIENCE=5
 MODEL_SEED=1
 LOADER_SEED=314159
@@ -42,12 +42,12 @@ TEXT_GATE_BIAS=-1.0
 
 TTF_MODULE="TTF_SemTime_Slots"
 MMF_MODULE="MMF_VarTime_SlotGate"
-SEMANTIC_SLOTS=4
+SEMANTIC_SLOTS=1
 RECENCY_SIGMA=0.25
-SEMANTIC_TIME_GATE_BIAS=-1.0
+SEMANTIC_TIME_GATE_BIAS=-2.0
 MMF_SLOT_ATTN_DIM=128
-MMF_SLOT_GATE_BIAS=-1.0
-KAPPA=0.5
+MMF_SLOT_GATE_BIAS=-2.0
+KAPPA=0.1
 USE_AMP=0
 DETECT_ANOMALY=0
 
@@ -74,14 +74,14 @@ Options:
   --text-gate-bias X    Legacy GPINet internal text-gate bias (default: -1.0)
   --TTF_module NAME      TTF module passed to main.py (default: TTF_SemTime_Slots)
   --MMF_module NAME      MMF module passed to main.py (default: MMF_VarTime_SlotGate)
-  --semantic_slots N     Semantic slots for TTF_SemTime_Slots (default: 4)
+  --semantic_slots N     Semantic slots for TTF_SemTime_Slots (default: 1)
   --recency_sigma X      Gaussian recency sigma on normalized time (default: 0.25)
   --semantic_time_gate_bias X
-                        Initial adaptive time-gate bias (default: -1.0)
+                        Initial adaptive time-gate bias (default: -2.0)
   --mmf_slot_attn_dim N MMF slot-attention dimension (default: 128)
   --mmf_slot_gate_bias X
-                        Initial MMF residual-gate bias (default: -1.0)
-  --kappa X             Maximum text residual scale (default: 0.5)
+                        Initial MMF residual-gate bias (default: -2.0)
+  --kappa X             Maximum text residual scale (default: 0.1)
   --amp                 Enable automatic mixed precision
   --detect-anomaly      Enable expensive autograd anomaly detection
   -h, --help            Show this help
@@ -96,13 +96,13 @@ Examples:
   ./scripts/run_semantic_slots.sh -n 1000 --text --epochs 50 --patience 10
   ./scripts/run_semantic_slots.sh -n 1000 --text \
     --TTF_module TTF_SemTime_Slots \
-    --semantic_slots 4 \
+    --semantic_slots 1 \
     --recency_sigma 0.25 \
-    --semantic_time_gate_bias -1.0 \
+    --semantic_time_gate_bias -2.0 \
     --MMF_module MMF_VarTime_SlotGate \
     --mmf_slot_attn_dim 128 \
-    --mmf_slot_gate_bias -1.0 \
-    --kappa 0.5
+    --mmf_slot_gate_bias -2.0 \
+    --kappa 0.1
 
 Sweep outputs:
   <output-dir>/final_metrics.log                  readable MSE/MAE summary
@@ -531,4 +531,3 @@ echo
 
 echo
 echo "### Done: fixed protocol / train_N=$TRAIN_N / text=$ENABLE_TEXT / model_seed=$MODEL_SEED ###"
-
