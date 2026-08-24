@@ -1,3 +1,4 @@
+# BUILD_ID: paper-xattn-diagnostics-v1-20260824
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -53,6 +54,12 @@ class MMF_XAttn_Add(nn.Module):
         self.layer_norm = nn.LayerNorm(C)
         self.dropout = nn.Dropout(dropout)
 
+        # Generic evaluation diagnostics.  This original MMF exposes its
+        # temporal attention and actual correction, but has no variable gate
+        # and no NULL mechanism.
+        self.last_slot_attention = None
+        self.last_correction = None
+
     def forward(self, Y_ts, E_txt, M_txt):
         """
         Args:
@@ -73,7 +80,14 @@ class MMF_XAttn_Add(nn.Module):
         key_pad = (~M_txt).view(B, 1).expand(-1, T)
 
         # 3) Multi-head attention
-        attn_out, _ = self.attn(Q, K, V, key_padding_mask=key_pad)
+        attn_out, attn_weights = self.attn(
+            Q,
+            K,
+            V,
+            key_padding_mask=key_pad,
+            need_weights=True,
+            average_attn_weights=True,
+        )
 
         # ——— NEW: nuke any NaNs for no-text samples ———
         mask_attn = M_txt.view(B, 1, 1).expand(-1, T, self.d_attn)
@@ -100,6 +114,9 @@ class MMF_XAttn_Add(nn.Module):
 
         # 7) Fuse with fixed kappa (convex blend)
         Y_fused = (Y_ts + self.kappa * delta_drop) / (1.0 + self.kappa)
+
+        self.last_slot_attention = attn_weights.detach()
+        self.last_correction = (Y_fused - Y_ts).detach()
         return Y_fused
 
 

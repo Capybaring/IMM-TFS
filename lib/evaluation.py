@@ -1,3 +1,4 @@
+# BUILD_ID: conditional-fusion-diagnostics-v1-20260824
 import math
 
 import torch
@@ -153,7 +154,22 @@ def _collect_fusion_diagnostics(fusion, mask, diag_sum, diag_count):
         correction = getattr(mmf, "last_correction", None)
         attention = getattr(mmf, "last_slot_attention", None)
 
-        _add_diag(diag_sum, diag_count, "text_null_probability_mean", null_prob)
+        # The current no-NULL SlotGate keeps an all-zero compatibility tensor,
+        # although NULL is no longer part of its forward computation.  Treat a
+        # NULL diagnostic as real only when the module explicitly opts in or
+        # actually owns the learned NULL key used by the earlier formulation.
+        supports_null = getattr(
+            mmf,
+            "supports_null_diagnostic",
+            hasattr(mmf, "null_key"),
+        )
+        if supports_null:
+            _add_diag(
+                diag_sum,
+                diag_count,
+                "text_null_probability_mean",
+                null_prob,
+            )
         _add_diag(diag_sum, diag_count, "text_gate_mean", gate)
         _add_diag(
             diag_sum,
@@ -183,16 +199,30 @@ def _collect_fusion_diagnostics(fusion, mask, diag_sum, diag_count):
                 changed.to(torch.float32)[observed],
             )
         if attention is not None:
-            entropy = -(
-                attention * attention.clamp_min(1e-8).log()
-            ).sum(dim=-1)
-            entropy = entropy / math.log(attention.shape[-1])
-            _add_diag(
-                diag_sum,
-                diag_count,
-                "text_attention_entropy",
-                entropy,
+            # Semantic-slot MMF may keep a compatibility-only NULL column.
+            # Measure entropy over real choices only, and omit the metric when
+            # there is only one real choice because its entropy is forced to 0.
+            real_choice_count = getattr(
+                mmf,
+                "semantic_slots",
+                attention.shape[-1],
             )
+            attention_for_entropy = attention[..., :real_choice_count]
+            if real_choice_count > 1:
+                attention_for_entropy = attention_for_entropy / (
+                    attention_for_entropy.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+                )
+                entropy = -(
+                    attention_for_entropy
+                    * attention_for_entropy.clamp_min(1e-8).log()
+                ).sum(dim=-1)
+                entropy = entropy / math.log(real_choice_count)
+                _add_diag(
+                    diag_sum,
+                    diag_count,
+                    "text_attention_entropy",
+                    entropy,
+                )
 
     if ttf is not None:
         slot_mass = getattr(ttf, "last_slot_mass", None)
@@ -249,6 +279,9 @@ def evaluation(
     mask_count = mask_count_mape = None
     correction_abs_sum = correction_signed_sum = None
     relevance_sum = gate_sum = null_probability_sum = None
+    has_relevance_diag = False
+    has_gate_diag = False
+    has_null_probability_diag = False
     diag_sum = {}
     diag_count = {}
 
@@ -315,12 +348,20 @@ def evaluation(
                 relevance = getattr(mmf, "last_variable_relevance", None)
                 gate_value = getattr(mmf, "last_gate", None)
                 null_value = getattr(mmf, "last_null_probability", None)
-                if relevance is not None:
+                supports_null = getattr(
+                    mmf,
+                    "supports_null_diagnostic",
+                    hasattr(mmf, "null_key"),
+                )
+                if torch.is_tensor(relevance):
                     relevance_sum += (relevance * mask).sum(dim=(0, 1))
-                if gate_value is not None:
+                    has_relevance_diag = True
+                if torch.is_tensor(gate_value):
                     gate_sum += (gate_value * mask).sum(dim=(0, 1))
-                if null_value is not None:
+                    has_gate_diag = True
+                if supports_null and torch.is_tensor(null_value):
                     null_probability_sum += (null_value * mask).sum(dim=(0, 1))
+                    has_null_probability_diag = True
             _collect_fusion_diagnostics(
                 fusion, mask, diag_sum, diag_count
             )
@@ -358,12 +399,6 @@ def evaluation(
         base_mae = base_mae_var[available].mean()
         correction_abs_var = correction_abs_sum / mask_count.clamp_min(1e-8)
         correction_signed_var = correction_signed_sum / mask_count.clamp_min(1e-8)
-        relevance_var = relevance_sum / mask_count.clamp_min(1e-8)
-        gate_var = gate_sum / mask_count.clamp_min(1e-8)
-        null_probability_var = (
-            null_probability_sum / mask_count.clamp_min(1e-8)
-        )
-
         results.update(
             {
                 "base_path_mse": base_mse.item(),
@@ -384,15 +419,31 @@ def evaluation(
                 "correction_signed_per_variable": _to_named_dict(
                     names, correction_signed_var
                 ),
-                "text_relevance_per_variable": _to_named_dict(
-                    names, relevance_var
-                ),
-                "text_gate_per_variable": _to_named_dict(names, gate_var),
-                "text_null_probability_per_variable": _to_named_dict(
-                    names, null_probability_var
-                ),
             }
         )
+
+        # These diagnostics are architecture-specific.  Do not emit a dict of
+        # fake zeros when the selected paper MMF does not implement the field.
+        if has_relevance_diag:
+            relevance_var = relevance_sum / mask_count.clamp_min(1e-8)
+            results["text_relevance_per_variable"] = _to_named_dict(
+                names,
+                relevance_var,
+            )
+        if has_gate_diag:
+            gate_var = gate_sum / mask_count.clamp_min(1e-8)
+            results["text_gate_per_variable"] = _to_named_dict(
+                names,
+                gate_var,
+            )
+        if has_null_probability_diag:
+            null_probability_var = (
+                null_probability_sum / mask_count.clamp_min(1e-8)
+            )
+            results["text_null_probability_per_variable"] = _to_named_dict(
+                names,
+                null_probability_var,
+            )
 
     for name, value_sum in diag_sum.items():
         results[name] = value_sum / max(diag_count[name], 1)

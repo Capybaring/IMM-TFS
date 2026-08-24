@@ -1,3 +1,4 @@
+# BUILD_ID: paper-gr-diagnostics-v1-20260824
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -28,6 +29,11 @@ class MMF_GR_Add(nn.Module):
         self.layer_norm = nn.LayerNorm(C)
         self.dropout = nn.Dropout(dropout)
 
+        # Generic evaluation diagnostics.  This original MMF has a text gate,
+        # but it does not have semantic-slot relevance or a NULL choice.
+        self.last_gate = None
+        self.last_correction = None
+
     def forward(self, Y_ts, E_txt, M_txt):
         """
         Args:
@@ -56,8 +62,14 @@ class MMF_GR_Add(nn.Module):
         mask = M_txt.view(B, 1, 1).expand(-1, T, C)  # (B, T, C)
         g = torch.where(mask, g, torch.ones_like(g))  # force g=1 if no text
 
-        # 5) Fuse: blend base & corrected forecasts
-        Y_fused = g * Y_ts + (1 - g) * (Y_ts + delta_drop)
+        # 5) Fuse: blend base & corrected forecasts.  ``1 - g`` is the
+        # effective text contribution gate in the original formulation.
+        text_gate = 1.0 - g
+        correction = text_gate * delta_drop
+        Y_fused = Y_ts + correction
+
+        self.last_gate = text_gate.detach()
+        self.last_correction = correction.detach()
         return Y_fused
 
 

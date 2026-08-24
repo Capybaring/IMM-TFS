@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# BUILD_ID: normal-terminal-final-only-log-v5-20260824
 set -euo pipefail
 
 # Semantic-slot GPINet runner for expanded MIMIC.
@@ -13,9 +14,10 @@ SWEEP=0
 SWEEP_SIZES_CSV="1000,2000,4000,6000,8000"
 SWEEP_MODES="both"
 OUTPUT_DIR=""
+RUN_LOG_OVERRIDE=""
 GPU=0
 EPOCHS=50
-BATCH_SIZE=16
+BATCH_SIZE=32
 PATIENCE=5
 MODEL_SEED=1
 LOADER_SEED=314159
@@ -40,8 +42,8 @@ DROPOUT=0.3
 TEXT_HEADS=1
 TEXT_GATE_BIAS=-1.0
 
-TTF_MODULE="TTF_SemTime_Slots"
-MMF_MODULE="MMF_VarTime_SlotGate"
+TTF_MODULE="TTF_T2V_XAttn"
+MMF_MODULE="MMF_GR_Add"
 SEMANTIC_SLOTS=1
 RECENCY_SIGMA=0.25
 SEMANTIC_TIME_GATE_BIAS=-2.0
@@ -64,6 +66,7 @@ Options:
   --sizes CSV           Sweep sizes (default: 1000,2000,4000,6000,8000)
   --modes MODE          Sweep modes: both, uni, or text (default: both)
   --output-dir DIR      Sweep log directory (default: timestamped directory)
+  --run-log FILE        Full log file for one run (normally set automatically)
   --epochs N            Epochs (default: 50)
   --batch-size N        Batch size (default: 16)
   --patience N          Early stopping patience (default: 5)
@@ -130,6 +133,7 @@ while [[ $# -gt 0 ]]; do
         --sizes) SWEEP_SIZES_CSV="$2"; shift 2 ;;
         --modes) SWEEP_MODES="$2"; shift 2 ;;
         --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+        --run-log) RUN_LOG_OVERRIDE="$2"; shift 2 ;;
         --epochs) EPOCHS="$2"; shift 2 ;;
         --batch-size) BATCH_SIZE="$2"; shift 2 ;;
         --patience) PATIENCE="$2"; shift 2 ;;
@@ -235,6 +239,9 @@ if [[ "$SWEEP" -eq 1 ]]; then
     echo "train_n,mode,text_enabled,model_seed,loader_seed,mse,mae,status,run_log" \
         > "$RESULTS_CSV"
 
+    echo "### Sweep started: sizes=$SWEEP_SIZES_CSV modes=$SWEEP_MODES seed=$MODEL_SEED"
+    echo "### Sweep output: $OUTPUT_DIR"
+
     FAILED_RUNS=0
     TOTAL_RUNS=0
     for size in "${SWEEP_SIZES[@]}"; do
@@ -265,6 +272,7 @@ if [[ "$SWEEP" -eq 1 ]]; then
                 --mmf_slot_attn_dim "$MMF_SLOT_ATTN_DIM"
                 --mmf_slot_gate_bias "$MMF_SLOT_GATE_BIAS"
                 --kappa "$KAPPA"
+                --run-log "$RUN_LOG"
             )
             if [[ "$USE_AMP" -eq 1 ]]; then
                 RUN_CMD+=(--amp)
@@ -276,15 +284,9 @@ if [[ "$SWEEP" -eq 1 ]]; then
                 RUN_CMD+=(--text)
             fi
 
-            echo
-            echo "##################################################################"
-            echo "### Sweep run $TOTAL_RUNS: train_n=$size mode=$mode"
-            echo "### Full log: $RUN_LOG"
-            echo "##################################################################"
-
             set +e
-            "${RUN_CMD[@]}" 2>&1 | tee "$RUN_LOG"
-            RUN_STATUS=${PIPESTATUS[0]}
+            "${RUN_CMD[@]}"
+            RUN_STATUS=$?
             set -e
 
             MSE="$(
@@ -306,7 +308,7 @@ if [[ "$SWEEP" -eq 1 ]]; then
 
             printf '%-10s %-10s %-18s %-18s %-10s\n' \
                 "$size" "$mode" "$MSE" "$MAE" "$status" \
-                | tee -a "$RESULTS_LOG"
+                >> "$RESULTS_LOG"
             printf '%s,%s,%s,%s,%s,%s,%s,%s,"%s"\n' \
                 "$size" "$mode" "$text_flag" "$MODEL_SEED" \
                 "$LOADER_SEED" "$MSE" "$MAE" "$status" "$RUN_LOG" \
@@ -319,7 +321,7 @@ if [[ "$SWEEP" -eq 1 ]]; then
         echo "finished_at : $(date '+%Y-%m-%d %H:%M:%S %z')"
         echo "total_runs  : $TOTAL_RUNS"
         echo "failed_runs : $FAILED_RUNS"
-    } | tee -a "$RESULTS_LOG"
+    } >> "$RESULTS_LOG"
 
     echo
     echo "### Sweep complete"
@@ -330,6 +332,24 @@ if [[ "$SWEEP" -eq 1 ]]; then
     fi
     exit 0
 fi
+
+RUN_MODE="uni"
+if [[ "$ENABLE_TEXT" -eq 1 ]]; then
+    RUN_MODE="text"
+fi
+if [[ -n "$RUN_LOG_OVERRIDE" ]]; then
+    if [[ "$RUN_LOG_OVERRIDE" = /* ]]; then
+        RUN_LOG="$RUN_LOG_OVERRIDE"
+    else
+        RUN_LOG="$REPO_ROOT/$RUN_LOG_OVERRIDE"
+    fi
+else
+    RUN_DIR="$REPO_ROOT/logs/gpinet_semantic_slots_runs"
+    RUN_STAMP="$(date '+%Y%m%d_%H%M%S')"
+    RUN_LOG="$RUN_DIR/gpinet_n${TRAIN_N}_${RUN_MODE}_seed${MODEL_SEED}_${RUN_STAMP}.log"
+fi
+mkdir -p "$(dirname "$RUN_LOG")"
+: > "$RUN_LOG"
 
 PROTOCOL="data/MIMIC/mimic_fixed_protocol.json"
 NORMALIZATION="data/MIMIC/mimic_fixed_normalization.pt"
@@ -389,37 +409,41 @@ fi
 MODE="numeric-only"
 [[ "$ENABLE_TEXT" -eq 1 ]] && MODE="multimodal"
 
-echo "=================================================================="
-echo "GPINet fixed/nested expanded-MIMIC experiment"
-echo "=================================================================="
-echo "full cohort subjects : $TOTAL_N"
-echo "full train pool      : $FULL_TRAIN_N"
-echo "TRAIN subjects used  : $TRAIN_N"
-echo "VAL subjects fixed   : $VAL_N"
-echo "TEST subjects fixed  : $TEST_N"
-echo "mode                  : $MODE"
-echo "model seed            : $MODEL_SEED"
-echo "loader seed           : $LOADER_SEED"
-echo "epochs / patience     : $EPOCHS / $PATIENCE"
-echo "batch size            : $BATCH_SIZE"
-echo "AMP / anomaly detect  : $USE_AMP / $DETECT_ANOMALY"
-echo "normalization         : fixed FULL-TRAIN HISTORY"
-if [[ "$ENABLE_TEXT" -eq 1 ]]; then
-    echo "TTF / MMF             : $TTF_MODULE / $MMF_MODULE"
-    echo "fusion heads          : $TEXT_HEADS"
-    echo "semantic slots        : $SEMANTIC_SLOTS"
-    echo "recency sigma         : $RECENCY_SIGMA"
-    echo "semantic time bias    : $SEMANTIC_TIME_GATE_BIAS"
-    echo "MMF attn dim / bias   : $MMF_SLOT_ATTN_DIM / $MMF_SLOT_GATE_BIAS"
-    echo "text scale kappa      : $KAPPA"
-    echo "legacy GP gate bias   : $TEXT_GATE_BIAS"
-fi
-echo "=================================================================="
+{
+    echo "=================================================================="
+    echo "GPINet fixed/nested expanded-MIMIC experiment"
+    echo "=================================================================="
+    echo "full cohort subjects : $TOTAL_N"
+    echo "full train pool      : $FULL_TRAIN_N"
+    echo "TRAIN subjects used  : $TRAIN_N"
+    echo "VAL subjects fixed   : $VAL_N"
+    echo "TEST subjects fixed  : $TEST_N"
+    echo "mode                  : $MODE"
+    echo "model seed            : $MODEL_SEED"
+    echo "loader seed           : $LOADER_SEED"
+    echo "epochs / patience     : $EPOCHS / $PATIENCE"
+    echo "batch size            : $BATCH_SIZE"
+    echo "AMP / anomaly detect  : $USE_AMP / $DETECT_ANOMALY"
+    echo "normalization         : fixed FULL-TRAIN HISTORY"
+    if [[ "$ENABLE_TEXT" -eq 1 ]]; then
+        echo "TTF / MMF             : $TTF_MODULE / $MMF_MODULE"
+        echo "fusion heads          : $TEXT_HEADS"
+        echo "semantic slots        : $SEMANTIC_SLOTS"
+        echo "recency sigma         : $RECENCY_SIGMA"
+        echo "semantic time bias    : $SEMANTIC_TIME_GATE_BIAS"
+        echo "MMF attn dim / bias   : $MMF_SLOT_ATTN_DIM / $MMF_SLOT_GATE_BIAS"
+        echo "text scale kappa      : $KAPPA"
+        echo "legacy GP gate bias   : $TEXT_GATE_BIAS"
+    fi
+    echo "full log              : $RUN_LOG"
+    echo "=================================================================="
+}
 
 if [[ "$ENABLE_TEXT" -eq 1 ]]; then
     echo
     echo "### [1/2] Ensuring embeddings for train_N + fixed val + fixed test ###"
-    python - "$PROTOCOL" "$TRAIN_N" "$DATASET" "$LLM_MODEL" "$LLM_LAYERS" "$MAX_LENGTH" "$TIME_UNIT" <<'PY'
+    set +e
+    python - "$PROTOCOL" "$TRAIN_N" "$DATASET" "$LLM_MODEL" "$LLM_LAYERS" "$MAX_LENGTH" "$TIME_UNIT" 2>&1 <<'PY'
 import json
 import sys
 import torch
@@ -461,6 +485,12 @@ compute_text_embeddings(
     record_ids=record_ids,
 )
 PY
+    EMBED_STATUS=$?
+    set -e
+    if [[ "$EMBED_STATUS" -ne 0 ]]; then
+        echo "### Embedding preparation failed with exit code $EMBED_STATUS ###"
+        exit "$EMBED_STATUS"
+    fi
     echo
     echo "### [2/2] Training GPINet multimodal ###"
 else
@@ -527,7 +557,70 @@ printf "### Command:"
 printf " %q" "${CMD[@]}"
 echo
 
-"${CMD[@]}"
+filter_final_log() {
+    tr '\r' '\n' \
+        | awk '
+            BEGIN {
+                final_output = 0
+                traceback = 0
+            }
 
-echo
-echo "### Done: fixed protocol / train_N=$TRAIN_N / text=$ENABLE_TEXT / model_seed=$MODEL_SEED ###"
+            final_output {
+                print
+                fflush()
+                next
+            }
+            /^Exp has been early stopped!$/ {
+                final_output = 1
+                print
+                fflush()
+                next
+            }
+            /^loss: / {
+                final_output = 1
+                print
+                fflush()
+                next
+            }
+
+            traceback {
+                print
+                fflush()
+                next
+            }
+            /^Traceback \(most recent call last\):/ {
+                traceback = 1
+                print
+                fflush()
+                next
+            }
+            /Error|ERROR|Exception|OOM|out of memory|NaN|Inf|Killed|Segmentation fault/ {
+                print
+                fflush()
+            }
+        ' > "$RUN_LOG"
+}
+
+set +e
+"${CMD[@]}" 2>&1 \
+    | tee >(filter_final_log)
+RUN_STATUS=${PIPESTATUS[0]}
+FILTER_PID="$!"
+if [[ -n "$FILTER_PID" ]]; then
+    wait "$FILTER_PID"
+fi
+set -e
+
+if [[ "$RUN_STATUS" -eq 0 ]]; then
+    echo >> "$RUN_LOG"
+    echo "### Done: fixed protocol / train_N=$TRAIN_N / text=$ENABLE_TEXT / model_seed=$MODEL_SEED ###" \
+        >> "$RUN_LOG"
+    echo "### Done: train_N=$TRAIN_N mode=$RUN_MODE seed=$MODEL_SEED"
+    echo "### Full results: $RUN_LOG"
+else
+    echo >> "$RUN_LOG"
+    echo "### Failed with exit code $RUN_STATUS ###" >> "$RUN_LOG"
+    echo "### Failed: train_N=$TRAIN_N mode=$RUN_MODE seed=$MODEL_SEED"
+    echo "### See full log: $RUN_LOG"
+    exit "$RUN_STATUS"
+fi
