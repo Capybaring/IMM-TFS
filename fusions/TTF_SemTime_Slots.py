@@ -114,6 +114,9 @@ class TTF_SemTime_Slots(nn.Module):
         self.last_time_gate = None
         self.last_fused_weights = None
         self.last_absolute_recency_strength = None
+        self.last_slot_outputs = None
+        self._routing_assignment = None
+        self._routing_note_mask = None
 
     @staticmethod
     def _masked_softmax(logits, valid_mask, dim=-1):
@@ -149,6 +152,34 @@ class TTF_SemTime_Slots(nn.Module):
             torch.ones_like(denom),
         )
         return consistency.clamp(0.0, 1.0)
+
+    def routing_loss(self) -> torch.Tensor:
+        """Encourage sharp per-note routing without collapsing one slot.
+
+        Entropy makes each note prefer one semantic slot.  The batch-level
+        balance term prevents the trivial solution in which every note picks
+        the same slot.  Both terms use only real notes.
+        """
+        if self._routing_assignment is None or self._routing_note_mask is None:
+            return self.slot_queries.sum() * 0.0
+
+        assignment = self._routing_assignment
+        valid_notes = self._routing_note_mask
+        valid_count = valid_notes.sum()
+        if valid_count == 0:
+            return assignment.sum() * 0.0
+
+        entropy = -(
+            assignment * assignment.clamp_min(1e-8).log()
+        ).sum(dim=1)
+        sharpness_loss = entropy[valid_notes].mean() / math.log(
+            self.semantic_slots
+        )
+
+        usage = assignment.sum(dim=(0, 2)) / valid_count.to(assignment.dtype)
+        uniform = torch.full_like(usage, 1.0 / self.semantic_slots)
+        balance_loss = self.semantic_slots * (usage - uniform).square().sum()
+        return sharpness_loss + 0.5 * balance_loss
 
     def forward(self, notes_input, tau: torch.Tensor, t_hat: torch.Tensor):
         if self.use_text_embeddings:
@@ -186,6 +217,12 @@ class TTF_SemTime_Slots(nn.Module):
         T_f = t_hat.shape[1]
         M_txt = note_mask.any(dim=1, keepdim=True)
         if K == 0:
+            self._routing_assignment = None
+            self._routing_note_mask = None
+            self.last_slot_assignment = None
+            self.last_semantic_weights = None
+            self.last_slot_mass = None
+            self.last_slot_outputs = None
             return V.new_zeros((B, T_f, self.d_txt)), M_txt
 
         V = self.input_proj(V)
@@ -209,6 +246,12 @@ class TTF_SemTime_Slots(nn.Module):
             slot_logits / self.assignment_temperature, dim=1
         )
         slot_assignment = slot_assignment * note_mask[:, None, :].to(V.dtype)
+        if self.training:
+            self._routing_assignment = slot_assignment
+            self._routing_note_mask = note_mask
+        else:
+            self._routing_assignment = None
+            self._routing_note_mask = None
 
         raw_slot_mass = slot_assignment.sum(dim=-1)
         valid_count = note_mask.sum(dim=-1, keepdim=True).to(V.dtype)
@@ -287,10 +330,10 @@ class TTF_SemTime_Slots(nn.Module):
             slot_outputs * absolute_recency_strength.unsqueeze(-1)
         )
 
-        # Suppress nearly unused slots but keep a balanced H-way assignment at
-        # unit scale.  This factor is meaningful because slot_mass is no longer
-        # identically one.
-        slot_strength = (slot_mass * self.semantic_slots).clamp(0.0, 1.0)
+        # Preserve the actual fraction of text evidence owned by each slot.
+        # Multiplying by H here would turn a soft [1/H, ..., 1/H] assignment
+        # back into H full-strength copies of the same note.
+        slot_strength = slot_mass.clamp(0.0, 1.0)
         slot_outputs = slot_outputs * slot_strength[:, :, None, None]
 
         E_txt = slot_outputs.permute(0, 2, 1, 3).reshape(B, T_f, self.d_txt)
@@ -305,5 +348,6 @@ class TTF_SemTime_Slots(nn.Module):
         self.last_absolute_recency_strength = (
             absolute_recency_strength.detach()
         )
+        self.last_slot_outputs = slot_outputs.detach()
 
         return E_txt, M_txt

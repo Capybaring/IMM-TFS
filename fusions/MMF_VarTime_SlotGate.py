@@ -1,8 +1,9 @@
-# BUILD_ID: semantic-slot-gate-warmup-v5-20260824
+# BUILD_ID: supervised-semantic-slot-gate-v6-20260829
 import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class FutureTime2Vec(nn.Module):
@@ -105,8 +106,9 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.time_proj = nn.Linear(d_time, self.d_attn, bias=False)
         self.query_norm = nn.LayerNorm(self.d_attn)
 
-        # Normalize real slots before attention.  Do not normalize the weighted
-        # context afterwards, so its magnitude remains available to the gate.
+        # Normalize slot direction before attention, then restore its RMS in
+        # forward().  Plain LayerNorm would erase TTF's recency and slot-mass
+        # strengths, making those controls ineffective for every non-zero slot.
         self.slot_norm = nn.LayerNorm(self.slot_dim)
         self.slot_key = nn.Linear(self.slot_dim, self.d_attn, bias=False)
         self.slot_value = nn.Linear(self.slot_dim, self.d_attn, bias=False)
@@ -135,19 +137,19 @@ class MMF_VarTime_SlotGate(nn.Module):
             std=float(delta_init_std),
         )
 
-        # Additive variable-specific relevance logit.  It is shared over future
-        # time but combined with a time-specific query gate below.  This is the
-        # main mechanism for learning that chest reports help only a subset of
-        # the physiological targets.
-        self.variable_gate_logit = nn.Parameter(torch.zeros(self.C))
-
         self.last_slot_attention = None
         self.last_null_probability = None
         self.last_gate = None
         self.last_variable_relevance = None
         self.last_delta = None
         self.last_correction = None
+        self.last_candidate_correction = None
+        self.last_text_mask = None
         self.last_gate_warmup_active = False
+        self._gate_for_aux = None
+        self._candidate_correction_for_aux = None
+        self._base_prediction_for_aux = None
+        self._text_mask_for_aux = None
 
     def set_training_epoch(self, epoch: int) -> None:
         """Inform the fusion gate which training epoch is about to run."""
@@ -212,7 +214,8 @@ class MMF_VarTime_SlotGate(nn.Module):
         text_mask = has_text.view(B, 1, 1).to(Y_ts.dtype)
 
         E_slots = E_txt.reshape(B, T, self.semantic_slots, self.slot_dim)
-        E_slots = self.slot_norm(E_slots)
+        slot_rms = E_slots.square().mean(dim=-1, keepdim=True).sqrt()
+        E_slots = self.slot_norm(E_slots) * slot_rms
 
         # Detach only the residual-query input.  The explicit addition at the
         # end keeps the normal identity gradient to the numerical backbone.
@@ -258,13 +261,12 @@ class MMF_VarTime_SlotGate(nn.Module):
             dim=-1,
         )
         gate_logits = self.gate_net(interaction).squeeze(-1)
-        gate_logits = gate_logits + self.variable_gate_logit.view(1, 1, C)
         learned_relevance = torch.sigmoid(gate_logits)
 
-        # Do not let the rejection gate kill an untrained residual.  Keeping a
-        # constant forward gate also intentionally freezes gate parameters in
-        # this phase; delta/attention/TTF receive useful gradients first.  The
-        # learned gate starts training after warmup from its neutral prior.
+        # Do not let the rejection gate kill an untrained residual.  The
+        # forward gate stays constant during warmup so delta/attention/TTF get
+        # useful gradients; gate_supervision_loss still trains the learned gate
+        # against its counterfactual relevance target from the first epoch.
         warmup_active = (
             self.training
             and self.training_epoch < self.gate_warmup_epochs
@@ -286,8 +288,25 @@ class MMF_VarTime_SlotGate(nn.Module):
             self.delta_out(self.delta_hidden(delta_features)).squeeze(-1)
         )
 
-        correction = self.kappa * gate * delta_text
+        candidate_correction = self.kappa * delta_text * text_mask
+        correction = gate * candidate_correction
         Y_out = Y_ts + correction
+
+        # Keep graph-connected tensors only during training.  The auxiliary
+        # target asks whether the ungated text candidate would reduce the local
+        # squared error relative to the numerical forecast.  This gives the
+        # gate an identifiable relevance objective instead of letting it trade
+        # scale arbitrarily with delta_text.
+        if self.training:
+            self._gate_for_aux = learned_relevance
+            self._candidate_correction_for_aux = candidate_correction
+            self._base_prediction_for_aux = Y_ts
+            self._text_mask_for_aux = text_mask
+        else:
+            self._gate_for_aux = None
+            self._candidate_correction_for_aux = None
+            self._base_prediction_for_aux = None
+            self._text_mask_for_aux = None
 
         # Preserve the old H+1 diagnostic shape by appending a zero-probability
         # NULL column.  This keeps evaluation entropy code valid when H == 1.
@@ -304,6 +323,36 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.last_variable_relevance = variable_relevance.detach()
         self.last_delta = delta_text.detach()
         self.last_correction = correction.detach()
+        self.last_candidate_correction = candidate_correction.detach()
+        self.last_text_mask = text_mask.detach()
         self.last_gate_warmup_active = bool(warmup_active)
 
         return Y_out
+
+    def gate_supervision_loss(
+        self,
+        target: torch.Tensor,
+        observed_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Train the gate to predict whether its text candidate is useful."""
+        gate = self._gate_for_aux
+        candidate = self._candidate_correction_for_aux
+        base_prediction = self._base_prediction_for_aux
+        text_mask = self._text_mask_for_aux
+        if any(
+            value is None
+            for value in (gate, candidate, base_prediction, text_mask)
+        ):
+            return self.delta_out.weight.sum() * 0.0
+
+        with torch.no_grad():
+            base_error = (target - base_prediction).square()
+            candidate_error = (
+                target - (base_prediction + candidate)
+            ).square()
+            relevance_target = (candidate_error < base_error).to(gate.dtype)
+            valid = observed_mask.to(torch.bool) & text_mask.to(torch.bool)
+
+        if not valid.any():
+            return gate.sum() * 0.0
+        return F.binary_cross_entropy(gate[valid], relevance_target[valid])

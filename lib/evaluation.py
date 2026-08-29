@@ -1,4 +1,4 @@
-# BUILD_ID: conditional-fusion-diagnostics-v1-20260824
+# BUILD_ID: supervised-fusion-diagnostics-v2-20260829
 import math
 
 import torch
@@ -73,16 +73,20 @@ def compute_all_losses(
     batch_dict,
     enable_text=True,
     use_text_embeddings=True,
+    fusion_base_loss_weight=0.0,
+    fusion_gate_loss_weight=0.0,
+    semantic_routing_loss_weight=0.0,
 ):
-    pred_y = model.forecasting(
+    base_pred = model.forecasting(
         batch_dict["tp_to_predict"],
         batch_dict["observed_data"],
         batch_dict["observed_tp"],
         batch_dict["observed_mask"],
     )
-    if not torch.isfinite(pred_y).all():
+    if not torch.isfinite(base_pred).all():
         raise ValueError("Numerical prediction contains NaN or Inf")
 
+    pred_y = base_pred
     if enable_text and fusion is not None:
         notes_input = (
             batch_dict["notes_embeddings"]
@@ -108,7 +112,50 @@ def compute_all_losses(
     mse = compute_error(target, pred_y, mask, "MSE", "mean")
     if not torch.isfinite(mse):
         raise ValueError("MSE is NaN or Inf")
-    return {"loss": mse, "mse": mse.item()}
+
+    loss = mse
+    results = {"mse": mse.item()}
+    if enable_text and fusion is not None:
+        base_mse = compute_error(target, base_pred, mask, "MSE", "mean")
+        gate_loss_fn = getattr(
+            getattr(fusion, "mmf", None),
+            "gate_supervision_loss",
+            None,
+        )
+        routing_loss_fn = getattr(
+            getattr(fusion, "ttf", None),
+            "routing_loss",
+            None,
+        )
+        gate_loss = (
+            gate_loss_fn(target, mask)
+            if gate_loss_fn is not None
+            else mse.new_zeros(())
+        )
+        routing_loss = (
+            routing_loss_fn()
+            if routing_loss_fn is not None
+            else mse.new_zeros(())
+        )
+        base_weight = float(fusion_base_loss_weight)
+        loss = (
+            (1.0 - base_weight) * mse
+            + base_weight * base_mse
+            + float(fusion_gate_loss_weight) * gate_loss
+            + float(semantic_routing_loss_weight) * routing_loss
+        )
+        results.update(
+            {
+                "base_mse": base_mse.item(),
+                "gate_loss": gate_loss.item(),
+                "routing_loss": routing_loss.item(),
+            }
+        )
+
+    if not torch.isfinite(loss):
+        raise ValueError("Training loss is NaN or Inf")
+    results["loss"] = loss
+    return results
 
 
 def masked_mse_nn(pred_y, target, mask):
@@ -143,7 +190,14 @@ def _add_diag(diag_sum, diag_count, name, value):
     diag_count[name] = diag_count.get(name, 0) + finite.numel()
 
 
-def _collect_fusion_diagnostics(fusion, mask, diag_sum, diag_count):
+def _collect_fusion_diagnostics(
+    fusion,
+    mask,
+    diag_sum,
+    diag_count,
+    target=None,
+    base_prediction=None,
+):
     mmf = getattr(fusion, "mmf", None)
     ttf = getattr(fusion, "ttf", None)
 
@@ -152,6 +206,12 @@ def _collect_fusion_diagnostics(fusion, mask, diag_sum, diag_count):
         gate = getattr(mmf, "last_gate", None)
         variable_relevance = getattr(mmf, "last_variable_relevance", None)
         correction = getattr(mmf, "last_correction", None)
+        candidate_correction = getattr(
+            mmf,
+            "last_candidate_correction",
+            None,
+        )
+        text_mask = getattr(mmf, "last_text_mask", None)
         attention = getattr(mmf, "last_slot_attention", None)
 
         # The current no-NULL SlotGate keeps an all-zero compatibility tensor,
@@ -198,6 +258,40 @@ def _collect_fusion_diagnostics(fusion, mask, diag_sum, diag_count):
                 "text_changed_fraction",
                 changed.to(torch.float32)[observed],
             )
+        if (
+            gate is not None
+            and candidate_correction is not None
+            and text_mask is not None
+            and target is not None
+            and base_prediction is not None
+        ):
+            base_error = (target - base_prediction).square()
+            candidate_error = (
+                target - (base_prediction + candidate_correction)
+            ).square()
+            gate_target = (candidate_error < base_error).to(gate.dtype)
+            valid = mask.to(torch.bool) & text_mask.to(torch.bool)
+            if valid.any():
+                _add_diag(
+                    diag_sum,
+                    diag_count,
+                    "text_gate_target_rate",
+                    gate_target[valid],
+                )
+                _add_diag(
+                    diag_sum,
+                    diag_count,
+                    "text_gate_brier",
+                    (gate[valid] - gate_target[valid]).square(),
+                )
+                _add_diag(
+                    diag_sum,
+                    diag_count,
+                    "text_gate_accuracy",
+                    ((gate[valid] >= 0.5) == (gate_target[valid] > 0.5)).to(
+                        torch.float32
+                    ),
+                )
         if attention is not None:
             # Semantic-slot MMF may keep a compatibility-only NULL column.
             # Measure entropy over real choices only, and omit the metric when
@@ -226,7 +320,8 @@ def _collect_fusion_diagnostics(fusion, mask, diag_sum, diag_count):
 
     if ttf is not None:
         slot_mass = getattr(ttf, "last_slot_mass", None)
-        weights = getattr(ttf, "last_semantic_weights", None)
+        assignment = getattr(ttf, "last_slot_assignment", None)
+        slot_outputs = getattr(ttf, "last_slot_outputs", None)
         absolute_recency = getattr(
             ttf,
             "last_absolute_recency_strength",
@@ -263,18 +358,64 @@ def _collect_fusion_diagnostics(fusion, mask, diag_sum, diag_count):
                 "ttf_effective_slot_count",
                 effective_slots[valid],
             )
-        if weights is not None and weights.shape[1] > 1:
-            normalized = torch.nn.functional.normalize(weights, dim=-1, eps=1e-8)
-            similarity = torch.einsum("bhk,bjk->bhj", normalized, normalized)
-            h = weights.shape[1]
-            off_diag = ~torch.eye(h, device=weights.device, dtype=torch.bool)
-            sample_similarity = similarity[:, off_diag].reshape(weights.shape[0], -1).mean(-1)
-            valid = weights.sum(dim=(-1, -2)) > 0
+        if assignment is not None and assignment.shape[1] > 1:
+            valid_notes = assignment.sum(dim=1) > 0
+            assignment_entropy = -(
+                assignment * assignment.clamp_min(1e-8).log()
+            ).sum(dim=1) / math.log(assignment.shape[1])
             _add_diag(
                 diag_sum,
                 diag_count,
-                "ttf_cross_slot_similarity",
-                sample_similarity[valid],
+                "ttf_assignment_entropy",
+                assignment_entropy[valid_notes],
+            )
+            note_count = valid_notes.sum()
+            if note_count > 0:
+                usage = assignment.sum(dim=(0, 2)) / note_count.to(
+                    assignment.dtype
+                )
+                uniform = torch.full_like(usage, 1.0 / assignment.shape[1])
+                imbalance = assignment.shape[1] * (
+                    usage - uniform
+                ).square().sum()
+                _add_diag(
+                    diag_sum,
+                    diag_count,
+                    "ttf_slot_usage_imbalance",
+                    imbalance.reshape(1),
+                )
+        if (
+            slot_outputs is not None
+            and slot_mass is not None
+            and slot_outputs.shape[1] > 1
+        ):
+            normalized = torch.nn.functional.normalize(
+                slot_outputs,
+                dim=-1,
+                eps=1e-8,
+            )
+            similarity = torch.einsum(
+                "bhtd,bjtd->bthj",
+                normalized,
+                normalized,
+            )
+            h = slot_outputs.shape[1]
+            valid_slots = slot_mass > 1e-6
+            valid_pairs = (
+                valid_slots[:, None, :, None]
+                & valid_slots[:, None, None, :]
+            ).expand(-1, slot_outputs.shape[2], -1, -1)
+            off_diag = ~torch.eye(
+                h,
+                device=slot_outputs.device,
+                dtype=torch.bool,
+            )
+            valid_pairs = valid_pairs & off_diag[None, None]
+            _add_diag(
+                diag_sum,
+                diag_count,
+                "ttf_cross_slot_output_similarity",
+                similarity[valid_pairs],
             )
 
 
@@ -381,7 +522,12 @@ def evaluation(
                     null_probability_sum += (null_value * mask).sum(dim=(0, 1))
                     has_null_probability_diag = True
             _collect_fusion_diagnostics(
-                fusion, mask, diag_sum, diag_count
+                fusion,
+                mask,
+                diag_sum,
+                diag_count,
+                target=target,
+                base_prediction=base_pred,
             )
 
     if fused_se_sum is None:

@@ -1,5 +1,6 @@
 import os
 import sys
+import importlib
 
 import time
 import datetime
@@ -21,40 +22,36 @@ from lib.evaluation import compute_all_losses, evaluation
 
 from lib.parse_datasets import parse_datasets, get_input_and_pred_len
 
-# NOTE: main.py used to import every baseline model unconditionally at
-# startup. That means a broken/incompatible optional dependency for ANY one
-# baseline (e.g. NeuralFlow's `stribor` -> `torchtyping`, which breaks on
-# newer torch versions with "Cannot subclass _TensorBase directly") would
-# crash the whole script even if you only wanted to run a different model
-# (e.g. `--model GPINet`). Each import is now wrapped so a single missing/
-# broken baseline only disables that one `--model <name>` choice instead of
-# blocking everything. `model_class = globals()[args.model]` (below, in
-# trainable()) will raise a clear KeyError if you try to select a model
-# whose import failed.
-_MODEL_IMPORTS = [
-    ("models.tPatchGNN", "tPatchGNN"),
-    ("models.GPINet", "GPINet"),
-    ("models.TimesNet", "TimesNet"),
-    ("models.DLinear", "DLinear"),
-    ("models.PatchTST", "PatchTST"),
-    ("models.NeuralFlow", "NeuralFlow"),
-    ("models.CRU", "CRU"),
-    ("models.LatentODE", "LatentODE"),
-    ("models.Informer", "Informer"),
-    ("models.TimeMixer", "TimeMixer"),
-    ("models.TimeLLM", "TimeLLM"),
-    ("models.TTM", "TTM"),
-]
-for _module_name, _class_name in _MODEL_IMPORTS:
+_MODEL_MODULES = {
+    "tPatchGNN": "models.tPatchGNN",
+    "GPINet": "models.GPINet",
+    "TimesNet": "models.TimesNet",
+    "DLinear": "models.DLinear",
+    "PatchTST": "models.PatchTST",
+    "NeuralFlow": "models.NeuralFlow",
+    "CRU": "models.CRU",
+    "LatentODE": "models.LatentODE",
+    "Informer": "models.Informer",
+    "TimeMixer": "models.TimeMixer",
+    "TimeLLM": "models.TimeLLM",
+    "TTM": "models.TTM",
+}
+
+
+def _load_model_class(model_name: str):
+    """Import only the selected model and isolate optional dependencies."""
+    module_name = _MODEL_MODULES.get(model_name)
+    if module_name is None:
+        available = ", ".join(sorted(_MODEL_MODULES))
+        raise ValueError(f"Unknown model {model_name!r}. Available: {available}")
     try:
-        _module = __import__(_module_name, fromlist=[_class_name])
-        globals()[_class_name] = getattr(_module, _class_name)
-    except Exception as _import_err:  # noqa: BLE001
-        print(
-            f"[WARN] Could not import {_class_name} from {_module_name}: "
-            f"{_import_err!r}. --model {_class_name} will be unavailable "
-            "until this dependency is fixed."
-        )
+        module = importlib.import_module(module_name)
+        return getattr(module, model_name)
+    except Exception as import_error:  # noqa: BLE001
+        raise RuntimeError(
+            f"Could not load --model {model_name} from {module_name}: "
+            f"{import_error!r}"
+        ) from import_error
 
 from fusions.FusionModel import FusionModel
 from fusions.load_llm import get_context_window_size
@@ -760,8 +757,32 @@ def get_args_from_parser() -> argparse.Namespace:
     parser.add_argument(
         "--fusion_lr_multiplier",
         type=float,
-        default=2.0,
+        default=1.0,
         help="Fusion-branch learning rate multiplier relative to --lr",
+    )
+    parser.add_argument(
+        "--fusion_base_loss_weight",
+        type=float,
+        default=0.25,
+        help="Mixture weight of direct backbone MSE in multimodal training",
+    )
+    parser.add_argument(
+        "--fusion_gate_loss_weight",
+        type=float,
+        default=0.1,
+        help="Weight of counterfactual text-relevance gate supervision",
+    )
+    parser.add_argument(
+        "--semantic_routing_loss_weight",
+        type=float,
+        default=0.01,
+        help="Weight of semantic-slot sharpness and balance regularization",
+    )
+    parser.add_argument(
+        "--fusion_weight_decay",
+        type=float,
+        default=1e-4,
+        help="Weight decay applied only to the fusion branch",
     )
     parser.add_argument(
         "--kappa",
@@ -845,6 +866,14 @@ def get_args_from_parser() -> argparse.Namespace:
         parser.error("--fusion_gate_warmup_value must be in (0, 1]")
     if args.fusion_lr_multiplier <= 0:
         parser.error("--fusion_lr_multiplier must be > 0")
+    if not 0.0 <= args.fusion_base_loss_weight < 1.0:
+        parser.error("--fusion_base_loss_weight must be in [0, 1)")
+    if args.fusion_gate_loss_weight < 0:
+        parser.error("--fusion_gate_loss_weight must be >= 0")
+    if args.semantic_routing_loss_weight < 0:
+        parser.error("--semantic_routing_loss_weight must be >= 0")
+    if args.fusion_weight_decay < 0:
+        parser.error("--fusion_weight_decay must be >= 0")
     if (
         args.enable_text
         and args.TTF_module == "TTF_SemTime_Slots"
@@ -1117,7 +1146,7 @@ def trainable(
     args.enc_in = args.C
     args.c_out = args.C
     args.input_len, args.pred_len = get_input_and_pred_len(data_obj)
-    model_class = globals()[args.model]
+    model_class = _load_model_class(args.model)
     model = model_class(args).to(args.device)
 
     # IMM-TFS-style multimodal routing:
@@ -1156,9 +1185,9 @@ def trainable(
     logger.info(input_command)
     logger.info(args)
 
-    # Keep the numerical backbone's original regularization, but do not apply
-    # weight decay to the sparse-text fusion branch.  Otherwise its already
-    # weak residual gradient can be pulled back toward zero.
+    # Keep both paths regularized.  The direct backbone loss below protects the
+    # numerical forecast, while weight decay and a non-amplified fusion LR keep
+    # the small gate from racing toward saturation.
     model_parameters = list(model.parameters())
     fusion_parameters = list(fusion.parameters()) if fusion is not None else []
     trainable_parameters = model_parameters + fusion_parameters
@@ -1167,11 +1196,11 @@ def trainable(
             [
                 {
                     "params": model_parameters,
-                    "weight_decay": args.w_decay,
+                    "weight_decay": args.fusion_weight_decay,
                 },
                 {
                     "params": fusion_parameters,
-                    "weight_decay": 0.0,
+                    "weight_decay": args.w_decay,
                     "lr": args.lr * args.fusion_lr_multiplier,
                 },
             ],
@@ -1287,6 +1316,9 @@ def trainable(
                                 batch_dict,
                                 args.enable_text,
                                 args.use_text_embeddings,
+                                args.fusion_base_loss_weight,
+                                args.fusion_gate_loss_weight,
+                                args.semantic_routing_loss_weight,
                             )
                             loss = train_res["loss"]
                         scaler.scale(loss).backward()
@@ -1303,6 +1335,9 @@ def trainable(
                             batch_dict,
                             args.enable_text,
                             args.use_text_embeddings,
+                            args.fusion_base_loss_weight,
+                            args.fusion_gate_loss_weight,
+                            args.semantic_routing_loss_weight,
                         )
                         loss = train_res["loss"]
                         loss.backward()
