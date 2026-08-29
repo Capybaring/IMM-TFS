@@ -1,4 +1,4 @@
-# BUILD_ID: stable-semantic-slots-v8-20260829
+# BUILD_ID: strict-semantic-slots-v9-20260829
 import math
 
 import torch
@@ -9,13 +9,12 @@ from fusions.load_llm import embed_notes, get_d_model, load_llm
 
 
 class TTF_SemTime_Slots(nn.Module):
-    """Competitive semantic-slot aggregation with adaptive recency.
+    """Strict semantic classification followed by slot-local aggregation.
 
-    Compared with independent ``softmax-over-notes`` slots, every real note is
-    first assigned *across slots*.  This creates actual competition between
-    slots and makes ``slot_mass`` meaningful.  Each slot then aggregates its
-    assigned notes over future time without a global projection that would mix
-    slot boundaries before MMF selection.
+    Every real note is assigned to exactly one slot in the forward pass.  Slot
+    decisions use shared semantic keys and distinct global prototypes, so a
+    slot never aggregates a note classified into another slot.  A
+    straight-through estimator preserves gradients through the hard decision.
 
     Relative note weights alone cannot make a single report become stale: a
     softmax over one report is always one.  This implementation therefore also
@@ -82,13 +81,24 @@ class TTF_SemTime_Slots(nn.Module):
             if d_model != self.d_txt
             else nn.Identity()
         )
-        self.key_proj = nn.Linear(self.d_txt, self.d_txt, bias=False)
-        self.value_proj = nn.Linear(self.d_txt, self.d_txt, bias=False)
+        # All slots classify notes in one shared semantic space.  The previous
+        # version gave every slot a different slice of a projected key, so its
+        # scores were not comparable as semantic-class scores.
+        self.key_proj = nn.Linear(self.d_txt, self.slot_dim, bias=False)
+        self.value_proj = nn.Linear(self.d_txt, self.slot_dim, bias=False)
         self.consistency_proj = nn.Linear(self.d_txt, self.d_txt, bias=False)
 
         self.slot_queries = nn.Parameter(
-            torch.randn(self.semantic_slots, self.slot_dim) * 0.1
+            torch.empty(self.semantic_slots, self.slot_dim)
         )
+        nn.init.orthogonal_(self.slot_queries)
+        # Remove a global slot preference before classification.  The running
+        # centre is used at evaluation so assignment is not batch-dependent.
+        self.register_buffer(
+            "slot_logit_center",
+            torch.zeros(self.semantic_slots, dtype=torch.float32),
+        )
+        self.slot_center_momentum = 0.95
         self.log_recency_sigma = nn.Parameter(
             torch.full(
                 (self.semantic_slots,),
@@ -125,6 +135,38 @@ class TTF_SemTime_Slots(nn.Module):
         self.last_fused_weights = None
         self.last_absolute_recency_strength = None
         self.last_slot_outputs = None
+        self.last_soft_slot_assignment = None
+
+    def _orthogonal_slot_prototypes(self) -> torch.Tensor:
+        """Return differentiable, unit, mutually orthogonal slot prototypes."""
+        basis = []
+        for slot_idx in range(self.semantic_slots):
+            vector = self.slot_queries[slot_idx].float()
+            for previous in basis:
+                vector = vector - torch.dot(vector, previous) * previous
+            basis.append(F.normalize(vector, dim=0, eps=1e-6))
+        return torch.stack(basis, dim=0)
+
+    def _center_slot_logits(
+        self,
+        slot_logits: torch.Tensor,
+        note_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Remove persistent global preference for one slot."""
+        valid_logits = slot_logits.permute(0, 2, 1)[note_mask]
+        if valid_logits.numel() == 0:
+            center = self.slot_logit_center
+        elif self.training:
+            batch_center = valid_logits.mean(dim=0)
+            with torch.no_grad():
+                self.slot_logit_center.mul_(self.slot_center_momentum).add_(
+                    batch_center.detach(),
+                    alpha=1.0 - self.slot_center_momentum,
+                )
+            center = batch_center.detach()
+        else:
+            center = self.slot_logit_center
+        return slot_logits - center.view(1, -1, 1)
 
     @staticmethod
     def _masked_softmax(logits, valid_mask, dim=-1):
@@ -213,31 +255,45 @@ class TTF_SemTime_Slots(nn.Module):
             self.last_semantic_weights = None
             self.last_slot_mass = None
             self.last_slot_outputs = None
+            self.last_soft_slot_assignment = None
             return V.new_zeros((B, T_f, self.d_txt)), M_txt
 
         V = self.input_proj(V)
         V = V * note_mask.unsqueeze(-1).to(V.dtype)
 
-        keys = self.key_proj(V).reshape(
-            B, K, self.semantic_slots, self.slot_dim
+        keys = F.normalize(self.key_proj(V).float(), dim=-1, eps=1e-6)
+        shared_values = self.value_proj(V)
+        values = shared_values.unsqueeze(1).expand(
+            B, self.semantic_slots, K, self.slot_dim
         )
-        values = self.value_proj(V).reshape(
-            B, K, self.semantic_slots, self.slot_dim
-        ).permute(0, 2, 1, 3)
 
-        # (B, H, K): compatibility between slot h and note k.
+        # (B, H, K): comparable cosine score between semantic prototype h and
+        # note k in the same shared key space.
+        slot_prototypes = self._orthogonal_slot_prototypes()
         slot_logits = torch.einsum(
-            "hd,bkhd->bhk", self.slot_queries, keys
-        ) / math.sqrt(self.slot_dim)
+            "hd,bkd->bhk", slot_prototypes, keys
+        )
+        slot_logits = self._center_slot_logits(slot_logits, note_mask)
 
-        # Deterministic competitive routing keeps train/eval behavior aligned.
-        # Compute the softmax in float32 so low-precision training cannot
-        # create NaNs in the Gumbel sampling path used by the previous version.
-        slot_assignment = torch.softmax(
+        # Forward: strict one-hot classification.  Backward: gradients of the
+        # corresponding soft assignment (straight-through estimator).
+        soft_assignment = torch.softmax(
             slot_logits.float() / self.assignment_temperature,
             dim=1,
         )
+        winning_slot = soft_assignment.argmax(dim=1)
+        hard_assignment = F.one_hot(
+            winning_slot,
+            num_classes=self.semantic_slots,
+        ).permute(0, 2, 1).to(soft_assignment.dtype)
+        hard_assignment = hard_assignment * note_mask[:, None, :].float()
+        slot_assignment = (
+            hard_assignment
+            + soft_assignment
+            - soft_assignment.detach()
+        )
         slot_assignment = slot_assignment * note_mask[:, None, :].float()
+        slot_note_mask = hard_assignment.to(torch.bool)
 
         raw_slot_mass = slot_assignment.sum(dim=-1)
         valid_count = note_mask.sum(dim=-1, keepdim=True).float()
@@ -285,14 +341,15 @@ class TTF_SemTime_Slots(nn.Module):
         time_logits = time_logits.clamp(min=-80.0, max=0.0)
         temporal_kernel = time_logits.exp()
 
-        # log assignment retains cross-slot competition while softmax over K
-        # creates a valid note distribution for each slot and future time.
+        # Only notes classified into a slot can participate in that slot's
+        # temporal aggregation.  This mask is the strict separation that the
+        # previous soft implementation was missing.
         base_logits = slot_assignment.clamp_min(1e-8).log()
         fused_logits = (
             base_logits[:, :, None, :]
             + time_gate[:, :, None, None] * time_logits
         )
-        fused_mask = note_mask[:, None, None, :].expand(
+        fused_mask = slot_note_mask[:, :, None, :].expand(
             B, self.semantic_slots, T_f, K
         )
         fused_weights = self._masked_softmax(fused_logits, fused_mask, dim=-1)
@@ -344,6 +401,7 @@ class TTF_SemTime_Slots(nn.Module):
         E_txt = E_txt * M_txt[:, :, None].to(E_txt.dtype)
 
         self.last_slot_assignment = slot_assignment.detach()
+        self.last_soft_slot_assignment = soft_assignment.detach()
         self.last_semantic_weights = semantic_weights.detach()
         self.last_slot_mass = slot_mass.detach()
         self.last_slot_consistency = consistency.detach()
