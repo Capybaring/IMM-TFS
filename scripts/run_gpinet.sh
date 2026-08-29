@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# One entry point for the formal fixed/nested GPINet experiments.
+# One entry point for independent-size GPINet Uni/Multi experiments.
 
 TRAIN_N=1000
 ENABLE_TEXT=0
@@ -15,6 +15,7 @@ EPOCHS=50
 BATCH_SIZE=16
 PATIENCE=10
 MODEL_SEED=1
+DATA_SEED=42
 LOADER_SEED=314159
 USE_AMP=0
 
@@ -37,11 +38,11 @@ KAPPA=0.1
 usage() {
     cat <<'EOF'
 Usage:
-  ./scripts/run_semantic_slots.sh -n N [--text] [options]
-  ./scripts/run_semantic_slots.sh --sweep [options]
+  ./scripts/run_gpinet.sh -n N [--text] [options]
+  ./scripts/run_gpinet.sh --sweep [options]
 
 Core options:
-  -n, --num N                 Number of fixed-protocol TRAIN subjects
+  -n, --num N                 Number of independently sampled TRAIN subjects
   --text                      Enable multimodal training
   --sweep                     Run all configured sizes and modes
   --sizes CSV                 Sweep sizes (default: 1000,2000,4000,6000,8000)
@@ -51,6 +52,7 @@ Core options:
   --patience N                Early-stop patience
   --gpu ID                    GPU id
   --seed N                    Model seed
+  --data-seed N               Training-subject sampling seed
   --loader-seed N             DataLoader seed
   --output-dir DIR            Log directory
   --amp                       Enable AMP
@@ -87,6 +89,7 @@ while [[ $# -gt 0 ]]; do
         --patience) PATIENCE="$2"; shift 2 ;;
         --gpu) GPU="$2"; shift 2 ;;
         --seed) MODEL_SEED="$2"; shift 2 ;;
+        --data-seed) DATA_SEED="$2"; shift 2 ;;
         --loader-seed) LOADER_SEED="$2"; shift 2 ;;
         --amp) USE_AMP=1; shift ;;
         --TTF_module) TTF_MODULE="$2"; shift 2 ;;
@@ -113,51 +116,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
-PROTOCOL="data/MIMIC/mimic_fixed_protocol.json"
-NORMALIZATION="data/MIMIC/mimic_fixed_normalization.pt"
-
-prepare_protocol() {
-    if [[ ! -f "$PROTOCOL" && ! -f "$NORMALIZATION" ]]; then
-        python scripts/prepare_mimic_fixed_protocol.py
-    elif [[ ! -f "$PROTOCOL" || ! -f "$NORMALIZATION" ]]; then
-        echo "Fixed protocol/scaler is incomplete; rebuild both with --force." >&2
-        exit 2
-    fi
-
-    python - "$PROTOCOL" <<'PY'
-import json, sys
-with open(sys.argv[1], encoding="utf-8") as f:
-    version = json.load(f).get("version")
-if version != "4-fixed-full-train-normalization":
-    raise SystemExit("Incompatible fixed protocol; rebuild it with --force.")
-PY
-}
-
 ensure_embeddings() {
     local train_n="$1"
-    python - "$PROTOCOL" "$train_n" <<'PY'
-import json, sys, torch
+    python - "$train_n" "$DATA_SEED" <<'PY'
+import sys, torch
 from compute_text_embeddings import compute_text_embeddings
+from lib.parse_datasets import select_mimic_subject_records
 
-with open(sys.argv[1], encoding="utf-8") as f:
-    protocol = json.load(f)
-train_n = int(sys.argv[2])
-subject_to_records = {
-    str(k): [str(r) for r in v]
-    for k, v in protocol["subject_to_records"].items()
-}
-records = []
-for subject in protocol["train_subject_order"][:train_n]:
-    records.extend(subject_to_records[str(subject)])
-records.extend(str(r) for r in protocol["val_records"])
-records.extend(str(r) for r in protocol["test_records"])
+selection = select_mimic_subject_records(
+    "data/MIMIC",
+    requested_train_n=int(sys.argv[1]),
+    data_seed=int(sys.argv[2]),
+)
 
 compute_text_embeddings(
     "MIMIC", "BERT", 6, 512,
     "cuda" if torch.cuda.is_available() else "cpu",
     time_unit="hours",
     episode_anchor_from_day_start=True,
-    record_ids=sorted(set(records)),
+    record_ids=selection["required_records"],
 )
 PY
 }
@@ -198,6 +175,7 @@ run_one() {
         --node_dim 10
         --hid_dim 64
         --dropout 0.3
+        --data_seed "$DATA_SEED"
         -n "$train_n"
     )
 
@@ -229,7 +207,7 @@ run_one() {
     fi
     [[ "$USE_AMP" -eq 1 ]] && cmd+=(--use_amp)
 
-    echo "### GPINet train_n=$train_n mode=$mode seed=$MODEL_SEED"
+    echo "### GPINet train_n=$train_n mode=$mode model_seed=$MODEL_SEED data_seed=$DATA_SEED"
     set +e
     "${cmd[@]}" 2>&1 | tee >(filter_final_log > "$log_file")
     local status=${PIPESTATUS[0]}
@@ -243,10 +221,6 @@ metric_from_log() {
     awk -F': ' -v key="$2" '$1 == key { value=$2 } END { print value }' "$1"
 }
 
-prepare_protocol
-export MIMIC_FIXED_PROTOCOL=1
-export MIMIC_PROTOCOL_PATH="$REPO_ROOT/$PROTOCOL"
-export MIMIC_NORMALIZATION_PATH="$REPO_ROOT/$NORMALIZATION"
 export MIMIC_LOADER_SEED="$LOADER_SEED"
 
 if [[ "$SWEEP" -eq 1 ]]; then
@@ -257,10 +231,10 @@ if [[ "$SWEEP" -eq 1 ]]; then
         *) echo "--modes must be both, uni, or text" >&2; exit 2 ;;
     esac
     IFS=',' read -r -a TRAIN_SIZES <<< "$SIZES"
-    OUTPUT_DIR="${OUTPUT_DIR:-logs/gpinet_semantic_slots_sweep/$(date '+%Y%m%d_%H%M%S')}"
+    OUTPUT_DIR="${OUTPUT_DIR:-logs/gpinet_independent_sweep/$(date '+%Y%m%d_%H%M%S')}"
     mkdir -p "$OUTPUT_DIR"
     SUMMARY="$OUTPUT_DIR/final_metrics.csv"
-    echo "train_n,mode,model_seed,loader_seed,mse,mae,status,run_log" > "$SUMMARY"
+    echo "train_n,mode,model_seed,data_seed,loader_seed,mse,mae,status,run_log" > "$SUMMARY"
 
     failures=0
     for train_n in "${TRAIN_SIZES[@]}"; do
@@ -276,7 +250,7 @@ if [[ "$SWEEP" -eq 1 ]]; then
             fi
             mse="$(metric_from_log "$log_file" mse)"
             mae="$(metric_from_log "$log_file" mae)"
-            echo "$train_n,$mode,$MODEL_SEED,$LOADER_SEED,${mse:-NA},${mae:-NA},$status,\"$log_file\"" >> "$SUMMARY"
+            echo "$train_n,$mode,$MODEL_SEED,$DATA_SEED,$LOADER_SEED,${mse:-NA},${mae:-NA},$status,\"$log_file\"" >> "$SUMMARY"
         done
     done
     echo "### Results: $SUMMARY"
@@ -286,7 +260,7 @@ fi
 
 mode="uni"
 [[ "$ENABLE_TEXT" -eq 1 ]] && mode="text"
-OUTPUT_DIR="${OUTPUT_DIR:-logs/gpinet_semantic_slots_runs}"
+OUTPUT_DIR="${OUTPUT_DIR:-logs/gpinet_independent_runs}"
 log_file="$OUTPUT_DIR/gpinet_n${TRAIN_N}_${mode}_seed${MODEL_SEED}_$(date '+%Y%m%d_%H%M%S').log"
 run_one "$TRAIN_N" "$ENABLE_TEXT" "$log_file"
 echo "### Results: $log_file"

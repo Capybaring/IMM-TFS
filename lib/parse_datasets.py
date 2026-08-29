@@ -1,5 +1,5 @@
 """
-Standalone expanded-MIMIC loader for IMM-TFS (v4 fixed/nested protocol).
+Standalone expanded-MIMIC loader for IMM-TFS.
 
 This module contains its own collate functions and does not depend on the
 original TIME-IMM lib.parse_datasets module.
@@ -14,11 +14,11 @@ Key differences from the original generic loader:
 1. no sliding-window re-chunking for expanded MIMIC;
 2. preserve the synthetic episode anchor (e.g. 2000-01-01 00:00:00);
 3. split at subject level before normalization;
-4. v2/debug mode: normalization is fitted on the current TRAIN HISTORY;
-5. v4/fixed mode: train/val/test IDs are persisted once and every Train_N,
-   Uni, and Text run reuses one FULL-TRAIN HISTORY scaler;
-6. dataset tensors stay on CPU; only mini-batches move to GPU;
-7. text exposes both:
+4. validation/test subjects are fixed across data sizes;
+5. each Train_N is sampled independently from the fixed training pool;
+6. normalization is fitted on the selected Train_N history only;
+7. dataset tensors stay on CPU; only mini-batches move to GPU;
+8. text exposes both:
        tau_raw : raw dataset units (hours for MIMIC)
        tau     : normalized to [0,1] by the total 48 h window
    so the generic FusionModel can share the same scale as tp_to_predict,
@@ -39,7 +39,6 @@ data/MIMIC/
 from __future__ import annotations
 
 import argparse
-import json
 import os
 
 import numpy as np
@@ -147,17 +146,6 @@ class ExpandedMIMICDataset(Dataset):
         ):
             wanted = {str(x) for x in args.rec_ids}
             rec_ids = [r for r in rec_ids if r in wanted]
-
-        self.is_subset = False
-        if isinstance(args, argparse.Namespace):
-            n = int(getattr(args, "n", int(1e8)))
-            if n < len(rec_ids):
-                rec_ids = rec_ids[:n]
-                self.is_subset = True
-                print(
-                    f"[ExpandedMIMIC] -n active: using {len(rec_ids):,} "
-                    f"of {len(all_rec_ids):,} records"
-                )
 
         if not rec_ids:
             raise RuntimeError(
@@ -424,29 +412,14 @@ class ExpandedMIMICDataset(Dataset):
         missing_features = torch.where(count == 0)[0].tolist()
         if missing_features:
             names = [self.feature_cols[i] for i in missing_features]
-            if self.is_subset:
-                # A tiny smoke subset can legitimately miss a rare variable.
-                # Keep it identity-scaled for smoke/debug only; a full run
-                # should never silently accept an unseen training variable.
-                print(
-                    "[ExpandedMIMIC][WARN] smoke/subset TRAIN HISTORY has zero "
-                    f"observations for {names}; using mean=0,std=1 for those "
-                    "features in this debug run."
-                )
-                count_safe = count.clone()
-                count_safe[missing_features] = 1.0
-            else:
-                raise ValueError(
-                    "The FULL TRAIN HISTORY split has zero observations for "
-                    f"these features, so normalization/model training is not "
-                    f"well-defined: {names}"
-                )
-        else:
-            count_safe = count
+            raise ValueError(
+                "The selected TRAIN HISTORY has zero observations for "
+                f"these features, so normalization/model training is not "
+                f"well-defined: {names}"
+            )
+        count_safe = count
 
         mean = summ / count_safe
-        if missing_features:
-            mean[missing_features] = 0.0
 
         # Sample variance (ddof=1), with a safe fallback for very small counts.
         numer = (sumsq - (summ.square() / count_safe)).clamp_min(0.0)
@@ -498,57 +471,6 @@ class ExpandedMIMICDataset(Dataset):
                 f"mean={self.norm_mean[i].item():.6g}, "
                 f"std={self.norm_std[i].item():.6g}, "
                 f"n={self.norm_count[i].item()}"
-            )
-
-    def apply_precomputed_normalization(
-        self,
-        feature_cols: list[str],
-        mean: torch.Tensor,
-        std: torch.Tensor,
-        count: torch.Tensor | None = None,
-        source: str = "precomputed normalization",
-    ):
-        """Apply a persisted feature-wise scaler without refitting it."""
-        if list(feature_cols) != list(self.feature_cols or []):
-            raise ValueError(
-                "Fixed normalization feature schema/order does not match the "
-                "loaded dataset.\n"
-                f"Expected: {self.feature_cols}\nGot: {feature_cols}"
-            )
-
-        mean = torch.as_tensor(mean, dtype=torch.float32).cpu()
-        std = torch.as_tensor(std, dtype=torch.float32).cpu()
-        if mean.numel() != len(feature_cols) or std.numel() != len(feature_cols):
-            raise ValueError("Fixed normalization mean/std length mismatch")
-        if (~torch.isfinite(mean)).any() or (~torch.isfinite(std)).any() or (std <= 0).any():
-            raise ValueError("Fixed normalization contains invalid mean/std values")
-
-        normalized_chunks = []
-        for cid, tt, vals, mask, texts in self.chunks:
-            z = (vals - mean) / std
-            z = torch.where(mask, z, torch.zeros_like(z))
-            normalized_chunks.append((cid, tt, z, mask, texts))
-        self.chunks = normalized_chunks
-
-        self.norm_mean = mean
-        self.norm_std = std
-        self.norm_count = (
-            torch.as_tensor(count, dtype=torch.long).cpu()
-            if count is not None
-            else torch.zeros_like(mean, dtype=torch.long)
-        )
-        self.normalization_source = source
-        print(f"[ExpandedMIMIC] applied FIXED normalization: {source}")
-        print(
-            f"[ExpandedMIMIC] fixed scaler features={len(feature_cols)}, "
-            f"count min={int(self.norm_count.min()) if self.norm_count.numel() else 0}, "
-            f"median={int(self.norm_count.median()) if self.norm_count.numel() else 0}, "
-            f"max={int(self.norm_count.max()) if self.norm_count.numel() else 0}"
-        )
-        for i in range(min(5, len(feature_cols))):
-            print(
-                f"  {feature_cols[i]}: mean={mean[i].item():.6g}, "
-                f"std={std[i].item():.6g}, n={self.norm_count[i].item()}"
             )
 
     def normalization_dict(self):
@@ -619,178 +541,112 @@ def _load_record_to_subject(
     return {r: mapping[r] for r in record_ids}
 
 
-def _subject_level_split(
-    chunks,
-    dataset_path: str,
-    random_state: int = 42,
-):
-    rec_ids = [
-        cid.rsplit("_chunk", 1)[0]
-        for cid, *_ in chunks
-    ]
-    rec_to_subject = _load_record_to_subject(dataset_path, rec_ids)
-
-    subjects = sorted(set(rec_to_subject.values()))
-    if len(subjects) < 5:
-        raise ValueError(
-            f"Need more subjects for a 60/20/20 split; got {len(subjects)}"
-        )
-
-    trainval_subj, test_subj = train_test_split(
-        subjects,
-        train_size=0.8,
-        random_state=random_state,
-        shuffle=True,
-    )
-    train_subj, val_subj = train_test_split(
-        trainval_subj,
-        train_size=0.75,
-        random_state=random_state,
-        shuffle=True,
-    )
-
-    train_subj = set(train_subj)
-    val_subj = set(val_subj)
-    test_subj = set(test_subj)
-
-    train_idx, val_idx, test_idx = [], [], []
-    for i, (cid, *_) in enumerate(chunks):
-        rec = cid.rsplit("_chunk", 1)[0]
-        subj = rec_to_subject[rec]
-        if subj in train_subj:
-            train_idx.append(i)
-        elif subj in val_subj:
-            val_idx.append(i)
-        elif subj in test_subj:
-            test_idx.append(i)
-        else:
-            raise RuntimeError(f"Unassigned subject: {subj}")
-
-    assert train_subj.isdisjoint(val_subj)
-    assert train_subj.isdisjoint(test_subj)
-    assert val_subj.isdisjoint(test_subj)
-
-    print(
-        "[ExpandedMIMIC] subject-level split 60/20/20: "
-        f"subjects train={len(train_subj):,}, "
-        f"val={len(val_subj):,}, test={len(test_subj):,}; "
-        f"episodes train={len(train_idx):,}, "
-        f"val={len(val_idx):,}, test={len(test_idx):,}"
-    )
-
-    return train_idx, val_idx, test_idx
-
-
-def _fixed_protocol_enabled() -> bool:
-    return os.environ.get("MIMIC_FIXED_PROTOCOL", "0").strip().lower() in {
-        "1", "true", "yes", "on"
-    }
-
-
-def _load_torch_payload(path: str):
-    try:
-        return torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location="cpu")
-
-
-def _load_fixed_protocol(dataset_path: str):
-    protocol_path = os.environ.get(
-        "MIMIC_PROTOCOL_PATH",
-        os.path.join(dataset_path, "mimic_fixed_protocol.json"),
-    )
-    if not os.path.isabs(protocol_path):
-        protocol_path = os.path.abspath(protocol_path)
-    if not os.path.isfile(protocol_path):
-        raise FileNotFoundError(
-            f"Fixed MIMIC protocol not found: {protocol_path}. "
-            "Run scripts/prepare_mimic_fixed_protocol.py first."
-        )
-    with open(protocol_path, "r", encoding="utf-8") as f:
-        protocol = json.load(f)
-
-    expected_version = "4-fixed-full-train-normalization"
-    if protocol.get("version") != expected_version:
-        raise RuntimeError(
-            "Fixed MIMIC protocol uses a stale/incompatible normalization. "
-            "Rebuild it once with: "
-            "python scripts/prepare_mimic_fixed_protocol.py --force"
-        )
-
-    norm_path = os.environ.get("MIMIC_NORMALIZATION_PATH")
-    if not norm_path:
-        norm_path = os.path.join(
-            os.path.dirname(protocol_path),
-            protocol.get("normalization_file", "mimic_fixed_normalization.pt"),
-        )
-    if not os.path.isabs(norm_path):
-        norm_path = os.path.abspath(norm_path)
-    if not os.path.isfile(norm_path):
-        raise FileNotFoundError(
-            f"Fixed MIMIC normalization not found: {norm_path}. "
-            "Rebuild it with scripts/prepare_mimic_fixed_protocol.py --force."
-        )
-
-    norm = _load_torch_payload(norm_path)
-    if norm.get("version") != expected_version:
-        raise RuntimeError(
-            "Fixed MIMIC protocol and normalization versions do not match. "
-            "Rebuild both with: "
-            "python scripts/prepare_mimic_fixed_protocol.py --force"
-        )
-    if list(norm.get("feature_cols", [])) != list(protocol.get("feature_cols", [])):
-        raise RuntimeError(
-            "Fixed MIMIC protocol and normalization feature schemas differ. "
-            "Rebuild both with: "
-            "python scripts/prepare_mimic_fixed_protocol.py --force"
-        )
-    for key in ("history", "pred_window", "time_unit", "split_seed", "train_order_seed"):
-        if norm.get(key) != protocol.get(key):
-            raise RuntimeError(
-                f"Fixed MIMIC protocol/scaler mismatch for {key!r}. "
-                "Rebuild both with scripts/prepare_mimic_fixed_protocol.py --force."
-            )
-    return protocol, norm, protocol_path, norm_path
-
 def _records_for_subjects(subjects, subject_to_records):
     records = []
     for subj in subjects:
         try:
             records.extend(subject_to_records[str(subj)])
         except KeyError as exc:
-            raise KeyError(f"Subject {subj} missing from fixed protocol mapping") from exc
+            raise KeyError(f"Subject {subj} missing from record mapping") from exc
     return [str(r) for r in records]
 
 
-def _fixed_nested_selection(protocol, requested_train_n: int):
-    train_order = [str(x) for x in protocol["train_subject_order"]]
-    if not train_order:
-        raise ValueError("Fixed protocol has an empty training subject order")
+def select_mimic_subject_records(
+    dataset_path: str,
+    requested_train_n: int,
+    data_seed: int = 42,
+    split_seed: int = 42,
+):
+    """Select one independent Train_N and fixed validation/test subjects."""
+    proc_dir = os.path.join(dataset_path, "processed")
+    if not os.path.isdir(proc_dir):
+        raise FileNotFoundError(f"Processed directory not found: {proc_dir}")
 
-    full_n = len(train_order)
-    if requested_train_n <= 0:
-        raise ValueError("In fixed protocol mode, -n must be a positive TRAIN-subject count")
-    train_n = min(int(requested_train_n), full_n)
-    if requested_train_n > full_n:
-        print(
-            f"[ExpandedMIMIC][WARN] requested -n {requested_train_n:,} exceeds "
-            f"the full fixed train pool {full_n:,}; using {full_n:,}."
+    record_ids = sorted(
+        name
+        for name in os.listdir(proc_dir)
+        if os.path.isdir(os.path.join(proc_dir, name))
+        and os.path.isfile(os.path.join(proc_dir, name, "time_series.csv"))
+    )
+    if not record_ids:
+        raise RuntimeError(f"No processed records under {proc_dir}")
+
+    rec_to_subject = _load_record_to_subject(dataset_path, record_ids)
+    subject_to_records: dict[str, list[str]] = {}
+    for record_id in record_ids:
+        subject = str(rec_to_subject[record_id])
+        subject_to_records.setdefault(subject, []).append(record_id)
+
+    subjects = sorted(subject_to_records)
+    if len(subjects) < 5:
+        raise ValueError(
+            f"Need more subjects for a 60/20/20 split; got {len(subjects)}"
         )
 
-    selected_subjects = train_order[:train_n]
-    subject_to_records = {
-        str(k): [str(r) for r in v]
-        for k, v in protocol["subject_to_records"].items()
-    }
+    trainval_subjects, test_subjects = train_test_split(
+        subjects,
+        train_size=0.8,
+        random_state=split_seed,
+        shuffle=True,
+    )
+    train_pool, val_subjects = train_test_split(
+        trainval_subjects,
+        train_size=0.75,
+        random_state=split_seed,
+        shuffle=True,
+    )
+    train_pool = sorted(map(str, train_pool))
+    val_subjects = sorted(map(str, val_subjects))
+    test_subjects = sorted(map(str, test_subjects))
+
+    if requested_train_n <= 0:
+        raise ValueError("-n must be a positive TRAIN-subject count")
+    if data_seed < 0:
+        raise ValueError("data_seed must be non-negative")
+
+    train_n = min(int(requested_train_n), len(train_pool))
+    if requested_train_n > len(train_pool):
+        print(
+            f"[ExpandedMIMIC][WARN] requested -n {requested_train_n:,} exceeds "
+            f"the training pool {len(train_pool):,}; using all subjects."
+        )
+
+    # Include N in the seed so different sizes are independent samples instead
+    # of prefixes of one shared permutation. Uni and Multi remain paired because
+    # the same (N, data_seed) always produces the same subjects.
+    rng = np.random.default_rng(np.random.SeedSequence([data_seed, train_n]))
+    selected_subjects = sorted(
+        map(
+            str,
+            rng.choice(train_pool, size=train_n, replace=False).tolist(),
+        )
+    )
     train_records = _records_for_subjects(selected_subjects, subject_to_records)
-    val_records = [str(x) for x in protocol["val_records"]]
-    test_records = [str(x) for x in protocol["test_records"]]
+    val_records = _records_for_subjects(val_subjects, subject_to_records)
+    test_records = _records_for_subjects(test_subjects, subject_to_records)
 
     required_records = sorted(set(train_records + val_records + test_records))
-    if set(train_records) & set(val_records) or set(train_records) & set(test_records) or set(val_records) & set(test_records):
-        raise RuntimeError("Fixed protocol record overlap detected")
+    if (
+        set(train_records) & set(val_records)
+        or set(train_records) & set(test_records)
+        or set(val_records) & set(test_records)
+    ):
+        raise RuntimeError("Train/validation/test record overlap detected")
 
-    return train_n, selected_subjects, train_records, val_records, test_records, required_records
+    return {
+        "subject_count": len(subjects),
+        "train_pool_count": len(train_pool),
+        "train_n": train_n,
+        "data_seed": int(data_seed),
+        "split_seed": int(split_seed),
+        "train_subjects": selected_subjects,
+        "val_subjects": val_subjects,
+        "test_subjects": test_subjects,
+        "train_records": train_records,
+        "val_records": val_records,
+        "test_records": test_records,
+        "required_records": required_records,
+    }
 
 
 def variable_time_collate_fn(batch, args, time_max=None):
@@ -1120,7 +976,7 @@ def parse_datasets(args, show_summary=True):
     """Parse the standalone expanded-MIMIC dataset."""
     if not str(args.dataset).upper().startswith("MIMIC"):
         raise ValueError(
-            "parse_datasets_mimic_expanded only supports MIMIC datasets; "
+            "lib.parse_datasets only supports MIMIC datasets; "
             f"got {args.dataset!r}"
         )
 
@@ -1135,123 +991,17 @@ def parse_datasets(args, show_summary=True):
         )
         args.split_method = "instance"
 
-    fixed_mode = _fixed_protocol_enabled()
-    protocol = norm_payload = None
-    protocol_path = norm_path = None
-    fixed_train_n = None
-    fixed_selected_subjects = None
-    fixed_train_records = fixed_val_records = fixed_test_records = None
+    data_seed = int(getattr(args, "data_seed", 42))
+    selection = select_mimic_subject_records(
+        dataset_path=dataset_path,
+        requested_train_n=int(getattr(args, "n", int(1e8))),
+        data_seed=data_seed,
+    )
 
-    if fixed_mode:
-        protocol, norm_payload, protocol_path, norm_path = _load_fixed_protocol(
-            dataset_path
-        )
-        requested_window = {
-            "history": float(args.history),
-            "pred_window": float(args.pred_window),
-            "time_unit": str(args.time_unit),
-        }
-        for key, requested_value in requested_window.items():
-            protocol_value = protocol.get(key)
-            if protocol_value != requested_value:
-                raise RuntimeError(
-                    f"Fixed MIMIC protocol {key}={protocol_value!r}, but this "
-                    f"run requested {requested_value!r}. Use the protocol's "
-                    "window/unit or rebuild the protocol intentionally."
-                )
-
-        # -n means TRAIN SUBJECT COUNT in fixed mode.
-        requested_train_n = int(getattr(args, "n", int(1e8)))
-        (
-            fixed_train_n,
-            fixed_selected_subjects,
-            fixed_train_records,
-            fixed_val_records,
-            fixed_test_records,
-            required_records,
-        ) = _fixed_nested_selection(protocol, requested_train_n)
-
-        # Load ONLY train_N + fixed val + fixed test. Disable the old prefix
-        # -n slicing inside ExpandedMIMICDataset while constructing it.
-        old_n = getattr(args, "n", None)
-        old_rec_ids = getattr(args, "rec_ids", None)
-        args.rec_ids = required_records
-        args.n = int(1e12)
-        try:
-            ds = ExpandedMIMICDataset(
-                root=dataset_path,
-                history=args.history,
-                pred_window=args.pred_window,
-                device=args.device,
-                time_unit=args.time_unit,
-                unit_scale=getattr(args, "unit_scale", None),
-                enable_text=args.enable_text,
-                use_text_embeddings=args.use_text_embeddings,
-                llm_model_fusion=args.llm_model_fusion,
-                llm_layers_fusion=args.llm_layers_fusion,
-                max_length=args.max_length,
-                args=args,
-            )
-        finally:
-            args.n = old_n
-            if old_rec_ids is None:
-                try:
-                    delattr(args, "rec_ids")
-                except AttributeError:
-                    pass
-            else:
-                args.rec_ids = old_rec_ids
-
-        loaded = set(ds.record_ids)
-        missing_required = sorted(set(required_records) - loaded)
-        if missing_required:
-            raise RuntimeError(
-                f"Fixed protocol requested {len(required_records):,} records but "
-                f"{len(missing_required):,} were not loaded. Examples: "
-                f"{missing_required[:10]}"
-            )
-
-        rec_to_idx = {rec: i for i, rec in enumerate(ds.record_ids)}
-        train_idx = [rec_to_idx[r] for r in fixed_train_records]
-        val_idx = [rec_to_idx[r] for r in fixed_val_records]
-        test_idx = [rec_to_idx[r] for r in fixed_test_records]
-
-        # Apply the exact same persisted reference scale to every Train_N and
-        # both modalities. It is fitted once from FULL fixed-TRAIN HISTORY;
-        # validation/test observations and all prediction targets are excluded.
-        ds.apply_precomputed_normalization(
-            feature_cols=list(norm_payload["feature_cols"]),
-            mean=norm_payload["mean"],
-            std=norm_payload["std"],
-            count=norm_payload.get("count"),
-            source=str(
-                norm_payload.get(
-                    "source", "fixed full-train history observations only"
-                )
-            ),
-        )
-
-        # Keep model dimensions constant across N, rather than letting a rare
-        # long record entering at larger N silently change architecture args.
-        ds.max_input_len = int(protocol["global_max_history_timestamps"])
-        ds.max_pred_len = int(protocol["global_max_prediction_timestamps"])
-
-        print("=" * 72)
-        print("Expanded MIMIC FIXED/NESTED scaling protocol")
-        print("=" * 72)
-        print(f"protocol file          : {protocol_path}")
-        print(f"normalization file     : {norm_path}")
-        print(f"full cohort subjects   : {int(protocol['subject_count']):,}")
-        print(f"full train subjects    : {len(protocol['train_subject_order']):,}")
-        print(f"TRAIN subjects used    : {fixed_train_n:,}")
-        print(f"VAL subjects fixed     : {int(protocol['val_subject_count']):,}")
-        print(f"TEST subjects fixed    : {int(protocol['test_subject_count']):,}")
-        print("nested train rule      : prefix of one persisted random train order")
-        print("normalization          : fixed FULL-TRAIN HISTORY z-score")
-        print("-n semantics           : TRAIN SUBJECT COUNT")
-        print("=" * 72)
-    else:
-        # Preserve v2/debug behavior for existing smoke runners.
+    # Load only the independently sampled Train_N and fixed validation/test.
+    old_rec_ids = getattr(args, "rec_ids", None)
+    args.rec_ids = selection["required_records"]
+    try:
         ds = ExpandedMIMICDataset(
             root=dataset_path,
             history=args.history,
@@ -1266,12 +1016,45 @@ def parse_datasets(args, show_summary=True):
             max_length=args.max_length,
             args=args,
         )
-        train_idx, val_idx, test_idx = _subject_level_split(
-            ds.chunks,
-            dataset_path=dataset_path,
-            random_state=42,
+    finally:
+        if old_rec_ids is None:
+            try:
+                delattr(args, "rec_ids")
+            except AttributeError:
+                pass
+        else:
+            args.rec_ids = old_rec_ids
+
+    missing_required = sorted(
+        set(selection["required_records"]) - set(ds.record_ids)
+    )
+    if missing_required:
+        raise RuntimeError(
+            f"The selected experiment requires "
+            f"{len(selection['required_records']):,} records, but "
+            f"{len(missing_required):,} were not loaded. Examples: "
+            f"{missing_required[:10]}"
         )
-        ds.fit_and_apply_train_history_normalization(train_idx)
+
+    rec_to_idx = {rec: index for index, rec in enumerate(ds.record_ids)}
+    train_idx = [rec_to_idx[r] for r in selection["train_records"]]
+    val_idx = [rec_to_idx[r] for r in selection["val_records"]]
+    test_idx = [rec_to_idx[r] for r in selection["test_records"]]
+    ds.fit_and_apply_train_history_normalization(train_idx)
+
+    print("=" * 72)
+    print("Expanded MIMIC independent-size experiment")
+    print("=" * 72)
+    print(f"full cohort subjects   : {selection['subject_count']:,}")
+    print(f"full train pool        : {selection['train_pool_count']:,}")
+    print(f"TRAIN subjects used    : {selection['train_n']:,}")
+    print(f"VAL subjects fixed     : {len(selection['val_subjects']):,}")
+    print(f"TEST subjects fixed    : {len(selection['test_subjects']):,}")
+    print(f"data seed              : {selection['data_seed']}")
+    print("train sampling         : independent for each N")
+    print("normalization          : selected Train_N history only")
+    print("-n semantics           : TRAIN SUBJECT COUNT")
+    print("=" * 72)
 
     all_chunks = ds.chunks
     _, _, first_vals, _, _ = all_chunks[0]
@@ -1292,14 +1075,11 @@ def parse_datasets(args, show_summary=True):
     val_ds = Subset(ds, val_idx)
     test_ds = Subset(ds, test_idx)
 
-    train_loader_kwargs = {}
-    if fixed_mode:
-        # Decouple minibatch order from model/fusion parameter initialization.
-        loader_seed = int(os.environ.get("MIMIC_LOADER_SEED", "314159"))
-        loader_generator = torch.Generator()
-        loader_generator.manual_seed(loader_seed)
-        train_loader_kwargs["generator"] = loader_generator
-        print(f"[ExpandedMIMIC] fixed train DataLoader seed: {loader_seed}")
+    loader_seed = int(os.environ.get("MIMIC_LOADER_SEED", "314159"))
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(loader_seed)
+    train_loader_kwargs = {"generator": loader_generator}
+    print(f"[ExpandedMIMIC] train DataLoader seed: {loader_seed}")
 
     train_loader = DataLoader(
         train_ds,
@@ -1333,17 +1113,16 @@ def parse_datasets(args, show_summary=True):
         "ds": ds,
         "normalization": ds.normalization_dict(),
     }
-    if fixed_mode:
-        out["fixed_protocol"] = {
-            "train_n": fixed_train_n,
-            "train_subjects": list(fixed_selected_subjects),
-            "train_records": list(fixed_train_records),
-            "val_records": list(fixed_val_records),
-            "test_records": list(fixed_test_records),
-            "protocol_path": protocol_path,
-            "normalization_path": norm_path,
-            "normalization_scope": "fixed full-train history only",
-        }
+    out["data_selection"] = {
+        "train_n": selection["train_n"],
+        "data_seed": selection["data_seed"],
+        "split_seed": selection["split_seed"],
+        "train_subjects": list(selection["train_subjects"]),
+        "train_records": list(selection["train_records"]),
+        "val_records": list(selection["val_records"]),
+        "test_records": list(selection["test_records"]),
+        "normalization_scope": "selected Train_N history only",
+    }
     return out
 
 
