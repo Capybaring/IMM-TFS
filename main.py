@@ -92,7 +92,8 @@ def get_args_from_parser() -> argparse.Namespace:
         help="Root directory for all data files",
     )
     parser.add_argument(
-        "-n",
+        "--num",
+        dest="n",
         type=int,
         default=int(1e8),
         help="Number of MIMIC training subjects",

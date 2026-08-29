@@ -600,14 +600,14 @@ def select_mimic_subject_records(
     test_subjects = sorted(map(str, test_subjects))
 
     if requested_train_n <= 0:
-        raise ValueError("-n must be a positive TRAIN-subject count")
+        raise ValueError("--num must be a positive TRAIN-subject count")
     if data_seed < 0:
         raise ValueError("data_seed must be non-negative")
 
     train_n = min(int(requested_train_n), len(train_pool))
     if requested_train_n > len(train_pool):
         print(
-            f"[ExpandedMIMIC][WARN] requested -n {requested_train_n:,} exceeds "
+            f"[ExpandedMIMIC][WARN] requested --num {requested_train_n:,} exceeds "
             f"the training pool {len(train_pool):,}; using all subjects."
         )
 
@@ -1053,7 +1053,7 @@ def parse_datasets(args, show_summary=True):
     print(f"data seed              : {selection['data_seed']}")
     print("train sampling         : independent for each N")
     print("normalization          : selected Train_N history only")
-    print("-n semantics           : TRAIN SUBJECT COUNT")
+    print("--num semantics        : TRAIN SUBJECT COUNT")
     print("=" * 72)
 
     all_chunks = ds.chunks
