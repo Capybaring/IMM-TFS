@@ -694,6 +694,15 @@ def get_args_from_parser() -> argparse.Namespace:
         help="Initial adaptive time-gate bias in TTF_SemTime_Slots",
     )
     parser.add_argument(
+        "--absolute_recency_floor",
+        type=float,
+        default=0.1,
+        help=(
+            "Minimum absolute text strength after age decay in "
+            "TTF_SemTime_Slots"
+        ),
+    )
+    parser.add_argument(
         "--n_heads_fusion",
         type=int,
         default=1,
@@ -717,8 +726,35 @@ def get_args_from_parser() -> argparse.Namespace:
     parser.add_argument(
         "--mmf_slot_gate_bias",
         type=float,
-        default=-1.0,
+        default=0.0,
         help="Initial residual-gate bias in MMF_VarTime_SlotGate",
+    )
+    parser.add_argument(
+        "--mmf_delta_init_std",
+        type=float,
+        default=1e-2,
+        help="Initial std of the semantic-slot residual output layer",
+    )
+    parser.add_argument(
+        "--fusion_gate_warmup_epochs",
+        type=int,
+        default=5,
+        help=(
+            "Epochs with a fixed non-zero semantic-slot text gate before "
+            "learned rejection is enabled"
+        ),
+    )
+    parser.add_argument(
+        "--fusion_gate_warmup_value",
+        type=float,
+        default=0.5,
+        help="Fixed semantic-slot text gate used during warmup",
+    )
+    parser.add_argument(
+        "--fusion_lr_multiplier",
+        type=float,
+        default=2.0,
+        help="Fusion-branch learning rate multiplier relative to --lr",
     )
     parser.add_argument(
         "--kappa",
@@ -791,6 +827,26 @@ def get_args_from_parser() -> argparse.Namespace:
     )
 
     args = parser.parse_args()
+
+    if not 0.0 <= args.absolute_recency_floor <= 1.0:
+        parser.error("--absolute_recency_floor must be in [0, 1]")
+    if args.mmf_delta_init_std <= 0:
+        parser.error("--mmf_delta_init_std must be > 0")
+    if args.fusion_gate_warmup_epochs < 0:
+        parser.error("--fusion_gate_warmup_epochs must be >= 0")
+    if not 0.0 < args.fusion_gate_warmup_value <= 1.0:
+        parser.error("--fusion_gate_warmup_value must be in (0, 1]")
+    if args.fusion_lr_multiplier <= 0:
+        parser.error("--fusion_lr_multiplier must be > 0")
+    if (
+        args.enable_text
+        and args.TTF_module == "TTF_SemTime_Slots"
+        and args.semantic_slots < 2
+    ):
+        parser.error(
+            "TTF_SemTime_Slots requires --semantic_slots >= 2; "
+            "one slot disables semantic routing"
+        )
 
     # Default nf_gru_units and nf_hidden_dim to args.hid_dim if not provided
     if args.nf_gru_units is None:
@@ -1109,6 +1165,7 @@ def trainable(
                 {
                     "params": fusion_parameters,
                     "weight_decay": 0.0,
+                    "lr": args.lr * args.fusion_lr_multiplier,
                 },
             ],
             lr=args.lr,
@@ -1187,6 +1244,13 @@ def trainable(
     no_improve_counter = 0
     for itr in range(args.epoch):
         st = time.time()
+
+        if fusion is not None:
+            fusion.set_training_epoch(itr)
+        gate_warmup_epochs = int(
+            getattr(getattr(fusion, "mmf", None), "gate_warmup_epochs", 0)
+        )
+        gate_warmup_active = fusion is not None and itr < gate_warmup_epochs
 
         ### Training ###
         model.train()
@@ -1305,6 +1369,11 @@ def trainable(
                     args.enable_text,
                     args.use_text_embeddings,
                 )
+            elif gate_warmup_active:
+                # The residual/TTF branch is still learning under a protected
+                # non-zero gate.  Do not let the fast numerical path terminate
+                # training before the learned rejection gate is even enabled.
+                no_improve_counter = 0
             else:
                 no_improve_counter += 1
 
@@ -1325,6 +1394,12 @@ def trainable(
                         val_res["text_gate_mean"],
                         val_res.get("text_attention_entropy", float("nan")),
                     )
+                )
+            if gate_warmup_active:
+                logger.info(
+                    "Val - Fusion gate warmup active: epoch %d/%d",
+                    itr + 1,
+                    gate_warmup_epochs,
                 )
             if test_res != None:
                 logger.info(

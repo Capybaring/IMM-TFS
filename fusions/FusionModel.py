@@ -83,6 +83,9 @@ class FusionModel(nn.Module):
                 time_gate_bias=getattr(
                     args, "semantic_time_gate_bias", -1.0
                 ),
+                absolute_recency_floor=getattr(
+                    args, "absolute_recency_floor", 0.1
+                ),
             )
         else:
             self.ttf = TTF_cls(
@@ -115,6 +118,13 @@ class FusionModel(nn.Module):
                 kappa=args.kappa,
                 semantic_slots=getattr(args, "semantic_slots", 4),
                 gate_bias=getattr(args, "mmf_slot_gate_bias", -1.0),
+                delta_init_std=getattr(args, "mmf_delta_init_std", 1e-2),
+                gate_warmup_epochs=getattr(
+                    args, "fusion_gate_warmup_epochs", 5
+                ),
+                gate_warmup_value=getattr(
+                    args, "fusion_gate_warmup_value", 0.5
+                ),
             )
         else:
             self.mmf = MMF_cls(
@@ -125,6 +135,12 @@ class FusionModel(nn.Module):
                 dropout=args.dropout,
                 kappa=args.kappa,
             )
+
+    def set_training_epoch(self, epoch: int) -> None:
+        """Propagate epoch state to fusion modules that use staged training."""
+        setter = getattr(self.mmf, "set_training_epoch", None)
+        if setter is not None:
+            setter(epoch)
 
     def forward(self, notes_input, tau, t_hat, Y_ts):
         """
@@ -145,4 +161,3 @@ class FusionModel(nn.Module):
         if torch.isnan(Y_out).any():
             raise ValueError("Y_out contains NaN values.")
         return Y_out
-

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# BUILD_ID: normal-terminal-final-only-log-v5-20260824
+# BUILD_ID: semantic-slot-effective-training-v6-20260824
 set -euo pipefail
 
 # Semantic-slot GPINet runner for expanded MIMIC.
@@ -17,8 +17,8 @@ OUTPUT_DIR=""
 RUN_LOG_OVERRIDE=""
 GPU=0
 EPOCHS=50
-BATCH_SIZE=32
-PATIENCE=5
+BATCH_SIZE=16
+PATIENCE=10
 MODEL_SEED=1
 LOADER_SEED=314159
 
@@ -42,13 +42,19 @@ DROPOUT=0.3
 TEXT_HEADS=1
 TEXT_GATE_BIAS=-1.0
 
-TTF_MODULE="TTF_T2V_XAttn"
-MMF_MODULE="MMF_GR_Add"
-SEMANTIC_SLOTS=1
+TEXT_DIM=128
+TTF_MODULE="TTF_SemTime_Slots"
+MMF_MODULE="MMF_VarTime_SlotGate"
+SEMANTIC_SLOTS=2
 RECENCY_SIGMA=0.25
-SEMANTIC_TIME_GATE_BIAS=-2.0
+SEMANTIC_TIME_GATE_BIAS=-1.0
+ABSOLUTE_RECENCY_FLOOR=0.1
 MMF_SLOT_ATTN_DIM=128
-MMF_SLOT_GATE_BIAS=-2.0
+MMF_SLOT_GATE_BIAS=0.0
+MMF_DELTA_INIT_STD=0.01
+FUSION_GATE_WARMUP_EPOCHS=5
+FUSION_GATE_WARMUP_VALUE=0.5
+FUSION_LR_MULTIPLIER=2.0
 KAPPA=0.1
 USE_AMP=0
 DETECT_ANOMALY=0
@@ -75,15 +81,26 @@ Options:
   --loader-seed N       Fixed DataLoader shuffle seed (default: 314159)
   --text-heads N        Attention heads used by fusion modules (default: 1)
   --text-gate-bias X    Legacy GPINet internal text-gate bias (default: -1.0)
-  --TTF_module NAME      TTF module passed to main.py (default: TTF_SemTime_Slots)
-  --MMF_module NAME      MMF module passed to main.py (default: MMF_VarTime_SlotGate)
-  --semantic_slots N     Semantic slots for TTF_SemTime_Slots (default: 1)
+  --text-dim N          Projected text dimension (default: 128)
+  --TTF_module NAME     TTF module passed to main.py (default: TTF_SemTime_Slots)
+  --MMF_module NAME     MMF module passed to main.py (default: MMF_VarTime_SlotGate)
+  --semantic_slots N    Semantic slots for TTF_SemTime_Slots (default: 2)
   --recency_sigma X      Gaussian recency sigma on normalized time (default: 0.25)
   --semantic_time_gate_bias X
-                        Initial adaptive time-gate bias (default: -2.0)
+                        Initial adaptive relative-time bias (default: -1.0)
+  --absolute-recency-floor X
+                        Minimum absolute text strength after age decay (default: 0.1)
   --mmf_slot_attn_dim N MMF slot-attention dimension (default: 128)
   --mmf_slot_gate_bias X
-                        Initial MMF residual-gate bias (default: -2.0)
+                        Initial MMF residual-gate bias (default: 0.0)
+  --mmf-delta-init-std X
+                        Residual output initialization std (default: 0.01)
+  --fusion-gate-warmup-epochs N
+                        Epochs with protected non-zero text gate (default: 5)
+  --fusion-gate-warmup-value X
+                        Fixed gate during warmup (default: 0.5)
+  --fusion-lr-multiplier X
+                        Fusion learning-rate multiplier (default: 2.0)
   --kappa X             Maximum text residual scale (default: 0.1)
   --amp                 Enable automatic mixed precision
   --detect-anomaly      Enable expensive autograd anomaly detection
@@ -99,12 +116,18 @@ Examples:
   ./scripts/run_semantic_slots.sh -n 1000 --text --epochs 50 --patience 10
   ./scripts/run_semantic_slots.sh -n 1000 --text \
     --TTF_module TTF_SemTime_Slots \
-    --semantic_slots 1 \
+    --text-dim 128 \
+    --semantic_slots 2 \
     --recency_sigma 0.25 \
-    --semantic_time_gate_bias -2.0 \
+    --semantic_time_gate_bias -1.0 \
+    --absolute-recency-floor 0.1 \
     --MMF_module MMF_VarTime_SlotGate \
     --mmf_slot_attn_dim 128 \
-    --mmf_slot_gate_bias -2.0 \
+    --mmf_slot_gate_bias 0.0 \
+    --mmf-delta-init-std 0.01 \
+    --fusion-gate-warmup-epochs 5 \
+    --fusion-gate-warmup-value 0.5 \
+    --fusion-lr-multiplier 2.0 \
     --kappa 0.1
 
 Sweep outputs:
@@ -142,16 +165,27 @@ while [[ $# -gt 0 ]]; do
         --loader-seed) LOADER_SEED="$2"; shift 2 ;;
         --text-heads) TEXT_HEADS="$2"; shift 2 ;;
         --text-gate-bias) TEXT_GATE_BIAS="$2"; shift 2 ;;
+        --text-dim) TEXT_DIM="$2"; shift 2 ;;
         --TTF_module|--ttf-module) TTF_MODULE="$2"; shift 2 ;;
         --MMF_module|--mmf-module) MMF_MODULE="$2"; shift 2 ;;
         --semantic_slots|--semantic-slots) SEMANTIC_SLOTS="$2"; shift 2 ;;
         --recency_sigma|--recency-sigma) RECENCY_SIGMA="$2"; shift 2 ;;
         --semantic_time_gate_bias|--semantic-time-gate-bias)
             SEMANTIC_TIME_GATE_BIAS="$2"; shift 2 ;;
+        --absolute_recency_floor|--absolute-recency-floor)
+            ABSOLUTE_RECENCY_FLOOR="$2"; shift 2 ;;
         --mmf_slot_attn_dim|--mmf-slot-attn-dim)
             MMF_SLOT_ATTN_DIM="$2"; shift 2 ;;
         --mmf_slot_gate_bias|--mmf-slot-gate-bias)
             MMF_SLOT_GATE_BIAS="$2"; shift 2 ;;
+        --mmf_delta_init_std|--mmf-delta-init-std)
+            MMF_DELTA_INIT_STD="$2"; shift 2 ;;
+        --fusion_gate_warmup_epochs|--fusion-gate-warmup-epochs)
+            FUSION_GATE_WARMUP_EPOCHS="$2"; shift 2 ;;
+        --fusion_gate_warmup_value|--fusion-gate-warmup-value)
+            FUSION_GATE_WARMUP_VALUE="$2"; shift 2 ;;
+        --fusion_lr_multiplier|--fusion-lr-multiplier)
+            FUSION_LR_MULTIPLIER="$2"; shift 2 ;;
         --kappa) KAPPA="$2"; shift 2 ;;
         --amp) USE_AMP=1; shift ;;
         --detect-anomaly) DETECT_ANOMALY=1; shift ;;
@@ -166,6 +200,7 @@ for pair in \
     "BATCH_SIZE:$BATCH_SIZE" \
     "PATIENCE:$PATIENCE" \
     "TEXT_HEADS:$TEXT_HEADS" \
+    "TEXT_DIM:$TEXT_DIM" \
     "SEMANTIC_SLOTS:$SEMANTIC_SLOTS" \
     "MMF_SLOT_ATTN_DIM:$MMF_SLOT_ATTN_DIM"; do
     name="${pair%%:*}"; value="${pair#*:}"
@@ -174,6 +209,11 @@ for pair in \
         exit 1
     fi
 done
+
+if ! [[ "$FUSION_GATE_WARMUP_EPOCHS" =~ ^[0-9]+$ ]]; then
+    echo "Error: FUSION_GATE_WARMUP_EPOCHS must be >= 0" >&2
+    exit 1
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -222,11 +262,16 @@ if [[ "$SWEEP" -eq 1 ]]; then
         echo "loader_seed      : $LOADER_SEED"
         echo "TTF module       : $TTF_MODULE"
         echo "MMF module       : $MMF_MODULE"
+        echo "text dimension   : $TEXT_DIM"
         echo "semantic slots   : $SEMANTIC_SLOTS"
         echo "recency sigma    : $RECENCY_SIGMA"
         echo "time gate bias   : $SEMANTIC_TIME_GATE_BIAS"
+        echo "absolute floor   : $ABSOLUTE_RECENCY_FLOOR"
         echo "MMF attn dim     : $MMF_SLOT_ATTN_DIM"
         echo "MMF gate bias    : $MMF_SLOT_GATE_BIAS"
+        echo "delta init std   : $MMF_DELTA_INIT_STD"
+        echo "gate warmup      : $FUSION_GATE_WARMUP_EPOCHS epochs @ $FUSION_GATE_WARMUP_VALUE"
+        echo "fusion LR factor : $FUSION_LR_MULTIPLIER"
         echo "text scale kappa : $KAPPA"
         echo "epochs/patience  : $EPOCHS/$PATIENCE"
         echo "batch_size       : $BATCH_SIZE"
@@ -264,13 +309,19 @@ if [[ "$SWEEP" -eq 1 ]]; then
                 --loader-seed "$LOADER_SEED"
                 --text-heads "$TEXT_HEADS"
                 --text-gate-bias "$TEXT_GATE_BIAS"
+                --text-dim "$TEXT_DIM"
                 --TTF_module "$TTF_MODULE"
                 --MMF_module "$MMF_MODULE"
                 --semantic_slots "$SEMANTIC_SLOTS"
                 --recency_sigma "$RECENCY_SIGMA"
                 --semantic_time_gate_bias "$SEMANTIC_TIME_GATE_BIAS"
+                --absolute-recency-floor "$ABSOLUTE_RECENCY_FLOOR"
                 --mmf_slot_attn_dim "$MMF_SLOT_ATTN_DIM"
                 --mmf_slot_gate_bias "$MMF_SLOT_GATE_BIAS"
+                --mmf-delta-init-std "$MMF_DELTA_INIT_STD"
+                --fusion-gate-warmup-epochs "$FUSION_GATE_WARMUP_EPOCHS"
+                --fusion-gate-warmup-value "$FUSION_GATE_WARMUP_VALUE"
+                --fusion-lr-multiplier "$FUSION_LR_MULTIPLIER"
                 --kappa "$KAPPA"
                 --run-log "$RUN_LOG"
             )
@@ -428,10 +479,15 @@ MODE="numeric-only"
     if [[ "$ENABLE_TEXT" -eq 1 ]]; then
         echo "TTF / MMF             : $TTF_MODULE / $MMF_MODULE"
         echo "fusion heads          : $TEXT_HEADS"
+        echo "text dimension        : $TEXT_DIM"
         echo "semantic slots        : $SEMANTIC_SLOTS"
         echo "recency sigma         : $RECENCY_SIGMA"
         echo "semantic time bias    : $SEMANTIC_TIME_GATE_BIAS"
+        echo "absolute recency floor: $ABSOLUTE_RECENCY_FLOOR"
         echo "MMF attn dim / bias   : $MMF_SLOT_ATTN_DIM / $MMF_SLOT_GATE_BIAS"
+        echo "MMF delta init std    : $MMF_DELTA_INIT_STD"
+        echo "gate warmup           : $FUSION_GATE_WARMUP_EPOCHS @ $FUSION_GATE_WARMUP_VALUE"
+        echo "fusion LR multiplier  : $FUSION_LR_MULTIPLIER"
         echo "text scale kappa      : $KAPPA"
         echo "legacy GP gate bias   : $TEXT_GATE_BIAS"
     fi
@@ -533,14 +589,20 @@ if [[ "$ENABLE_TEXT" -eq 1 ]]; then
         --llm_layers_fusion "$LLM_LAYERS"
         --max_length "$MAX_LENGTH"
         --n_heads_fusion "$TEXT_HEADS"
+        --d_txt "$TEXT_DIM"
         --gpinet_text_gate_bias "$TEXT_GATE_BIAS"
         --TTF_module "$TTF_MODULE"
         --MMF_module "$MMF_MODULE"
         --semantic_slots "$SEMANTIC_SLOTS"
         --recency_sigma "$RECENCY_SIGMA"
         --semantic_time_gate_bias "$SEMANTIC_TIME_GATE_BIAS"
+        --absolute_recency_floor "$ABSOLUTE_RECENCY_FLOOR"
         --mmf_slot_attn_dim "$MMF_SLOT_ATTN_DIM"
         --mmf_slot_gate_bias "$MMF_SLOT_GATE_BIAS"
+        --mmf_delta_init_std "$MMF_DELTA_INIT_STD"
+        --fusion_gate_warmup_epochs "$FUSION_GATE_WARMUP_EPOCHS"
+        --fusion_gate_warmup_value "$FUSION_GATE_WARMUP_VALUE"
+        --fusion_lr_multiplier "$FUSION_LR_MULTIPLIER"
         --kappa "$KAPPA"
     )
 fi

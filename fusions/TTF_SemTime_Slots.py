@@ -16,6 +16,12 @@ class TTF_SemTime_Slots(nn.Module):
     assigned notes over future time without a global projection that would mix
     slot boundaries before MMF selection.
 
+    Relative note weights alone cannot make a single report become stale: a
+    softmax over one report is always one.  This implementation therefore also
+    computes an *absolute* recency strength for every slot/future time and
+    multiplies it into the slot output.  The configurable floor keeps old but
+    potentially useful clinical context from being erased completely.
+
     Public interface:
         E_txt, M_txt = module(notes_input, tau, t_hat)
     """
@@ -34,16 +40,22 @@ class TTF_SemTime_Slots(nn.Module):
         recency_sigma: float = 1.0,
         time_gate_bias: float = -1.0,
         assignment_temperature: float = 0.7,
+        absolute_recency_floor: float = 0.1,
     ):
         super().__init__()
         del n_heads_fusion
 
-        if semantic_slots < 1:
-            raise ValueError("semantic_slots must be >= 1")
+        if semantic_slots < 2:
+            raise ValueError(
+                "TTF_SemTime_Slots requires semantic_slots >= 2; "
+                "one slot collapses semantic routing to a constant"
+            )
         if recency_sigma <= 0:
             raise ValueError("recency_sigma must be > 0")
         if assignment_temperature <= 0:
             raise ValueError("assignment_temperature must be > 0")
+        if not 0.0 <= absolute_recency_floor <= 1.0:
+            raise ValueError("absolute_recency_floor must be in [0, 1]")
 
         self.use_text_embeddings = use_text_embeddings
         if not use_text_embeddings:
@@ -62,6 +74,7 @@ class TTF_SemTime_Slots(nn.Module):
         self.slot_dim = self.d_txt // self.semantic_slots
         self.max_length = int(max_length)
         self.assignment_temperature = float(assignment_temperature)
+        self.absolute_recency_floor = float(absolute_recency_floor)
 
         self.input_proj = (
             nn.Linear(d_model, self.d_txt)
@@ -100,6 +113,7 @@ class TTF_SemTime_Slots(nn.Module):
         self.last_slot_consistency = None
         self.last_time_gate = None
         self.last_fused_weights = None
+        self.last_absolute_recency_strength = None
 
     @staticmethod
     def _masked_softmax(logits, valid_mask, dim=-1):
@@ -232,6 +246,7 @@ class TTF_SemTime_Slots(nn.Module):
         time_logits = -(
             delta[:, None, :, :] / sigma[None, :, None, None]
         ).square()
+        temporal_kernel = time_logits.exp()
 
         # log assignment retains cross-slot competition while softmax over K
         # creates a valid note distribution for each slot and future time.
@@ -252,6 +267,26 @@ class TTF_SemTime_Slots(nn.Module):
             self.dropout(self.slot_output_norm(slot_outputs))
         )
 
+        # Absolute evidence strength does not normalize away with K=1.  It is
+        # the assignment-weighted Gaussian age of the reports owned by each
+        # slot.  This is deliberately separate from ``fused_weights``:
+        # fused_weights selects *which* report to use, while this term controls
+        # how much stale text should affect the forecast at all.
+        recency_numer = (
+            slot_assignment[:, :, None, :] * temporal_kernel
+        ).sum(dim=-1)
+        recency_denom = raw_slot_mass[:, :, None].clamp_min(1e-8)
+        absolute_recency_strength = recency_numer / recency_denom
+        absolute_recency_strength = (
+            self.absolute_recency_floor
+            + (1.0 - self.absolute_recency_floor)
+            * absolute_recency_strength
+        )
+        absolute_recency_strength = absolute_recency_strength.clamp(0.0, 1.0)
+        slot_outputs = (
+            slot_outputs * absolute_recency_strength.unsqueeze(-1)
+        )
+
         # Suppress nearly unused slots but keep a balanced H-way assignment at
         # unit scale.  This factor is meaningful because slot_mass is no longer
         # identically one.
@@ -267,5 +302,8 @@ class TTF_SemTime_Slots(nn.Module):
         self.last_slot_consistency = consistency.detach()
         self.last_time_gate = time_gate.detach()
         self.last_fused_weights = fused_weights.detach()
+        self.last_absolute_recency_strength = (
+            absolute_recency_strength.detach()
+        )
 
         return E_txt, M_txt

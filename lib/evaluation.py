@@ -227,6 +227,24 @@ def _collect_fusion_diagnostics(fusion, mask, diag_sum, diag_count):
     if ttf is not None:
         slot_mass = getattr(ttf, "last_slot_mass", None)
         weights = getattr(ttf, "last_semantic_weights", None)
+        absolute_recency = getattr(
+            ttf,
+            "last_absolute_recency_strength",
+            None,
+        )
+        if absolute_recency is not None:
+            recency_values = absolute_recency
+            if slot_mass is not None:
+                valid_slots = (slot_mass > 0).unsqueeze(-1).expand_as(
+                    absolute_recency
+                )
+                recency_values = absolute_recency[valid_slots]
+            _add_diag(
+                diag_sum,
+                diag_count,
+                "text_absolute_recency_strength_mean",
+                recency_values,
+            )
         if slot_mass is not None:
             _add_diag(
                 diag_sum,

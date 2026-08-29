@@ -1,4 +1,4 @@
-# BUILD_ID: no-null-variable-gate-v4-20260823
+# BUILD_ID: semantic-slot-gate-warmup-v5-20260824
 import math
 
 import torch
@@ -22,11 +22,12 @@ class FutureTime2Vec(nn.Module):
 class MMF_VarTime_SlotGate(nn.Module):
     """Variable-time residual fusion over semantic text slots.
 
-    The final delta layer is initialized with a very small non-zero weight,
-    and the post-attention context is not layer-normalized.  Real-slot
-    attention selects text content; the variable-time relevance gate is the
-    only learned text rejection mechanism.  This avoids a learnable NULL token
-    collapsing to probability one before the sparse-text branch can learn.
+    Real-slot attention selects text content; the variable-time relevance gate
+    rejects unhelpful text.  During a short training warmup the gate is held at
+    a non-zero value so the residual and TTF branches can learn before the gate
+    is allowed to close.  This avoids the multiplicative cold start
+    ``correction = kappa * gate * delta`` that previously drove every gate to
+    approximately zero.
 
     Shapes:
         Y_ts:  (B, T, C)
@@ -44,15 +45,21 @@ class MMF_VarTime_SlotGate(nn.Module):
         dropout: float = 0.1,
         kappa: float = 0.1,
         semantic_slots: int = 4,
-        gate_bias: float = -2.0,
+        gate_bias: float = 0.0,
+        delta_init_std: float = 1e-2,
+        gate_warmup_epochs: int = 5,
+        gate_warmup_value: float = 0.5,
         null_logit_bias: float = 1.0,
     ):
         super().__init__()
 
         if C < 1:
             raise ValueError("C must be >= 1")
-        if semantic_slots < 1:
-            raise ValueError("semantic_slots must be >= 1")
+        if semantic_slots < 2:
+            raise ValueError(
+                "MMF_VarTime_SlotGate requires semantic_slots >= 2; "
+                "one slot makes slot attention identically one"
+            )
         if d_txt % semantic_slots != 0:
             raise ValueError(
                 f"d_txt={d_txt} must be divisible by semantic_slots={semantic_slots}"
@@ -66,6 +73,12 @@ class MMF_VarTime_SlotGate(nn.Module):
             )
         if kappa < 0:
             raise ValueError("kappa must be >= 0")
+        if delta_init_std <= 0:
+            raise ValueError("delta_init_std must be > 0")
+        if gate_warmup_epochs < 0:
+            raise ValueError("gate_warmup_epochs must be >= 0")
+        if not 0.0 < gate_warmup_value <= 1.0:
+            raise ValueError("gate_warmup_value must be in (0, 1]")
 
         self.C = int(C)
         self.d_txt = int(d_txt)
@@ -75,6 +88,9 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.n_heads = int(n_heads_fusion)
         self.head_dim = self.d_attn // self.n_heads
         self.kappa = float(kappa)
+        self.gate_warmup_epochs = int(gate_warmup_epochs)
+        self.gate_warmup_value = float(gate_warmup_value)
+        self.training_epoch = 0
         # Retained only for constructor compatibility with older runners and
         # checkpoints.  NULL no longer participates in attention or gating.
         del null_logit_bias
@@ -101,7 +117,10 @@ class MMF_VarTime_SlotGate(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(self.d_attn, 1),
         )
-        nn.init.zeros_(self.gate_net[-1].weight)
+        # A small non-zero weight lets gate decisions depend on text/numeric
+        # interactions as soon as warmup ends.  A zero final layer made every
+        # patient, variable and future time start with the same gate.
+        nn.init.normal_(self.gate_net[-1].weight, mean=0.0, std=1e-2)
         nn.init.constant_(self.gate_net[-1].bias, float(gate_bias))
 
         self.delta_hidden = nn.Sequential(
@@ -110,7 +129,11 @@ class MMF_VarTime_SlotGate(nn.Module):
             nn.Dropout(dropout),
         )
         self.delta_out = nn.Linear(self.d_attn, 1, bias=False)
-        nn.init.normal_(self.delta_out.weight, mean=0.0, std=1e-3)
+        nn.init.normal_(
+            self.delta_out.weight,
+            mean=0.0,
+            std=float(delta_init_std),
+        )
 
         # Additive variable-specific relevance logit.  It is shared over future
         # time but combined with a time-specific query gate below.  This is the
@@ -124,6 +147,13 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.last_variable_relevance = None
         self.last_delta = None
         self.last_correction = None
+        self.last_gate_warmup_active = False
+
+    def set_training_epoch(self, epoch: int) -> None:
+        """Inform the fusion gate which training epoch is about to run."""
+        if epoch < 0:
+            raise ValueError("epoch must be >= 0")
+        self.training_epoch = int(epoch)
 
     def _prepare_time(
         self,
@@ -229,7 +259,23 @@ class MMF_VarTime_SlotGate(nn.Module):
         )
         gate_logits = self.gate_net(interaction).squeeze(-1)
         gate_logits = gate_logits + self.variable_gate_logit.view(1, 1, C)
-        variable_relevance = torch.sigmoid(gate_logits)
+        learned_relevance = torch.sigmoid(gate_logits)
+
+        # Do not let the rejection gate kill an untrained residual.  Keeping a
+        # constant forward gate also intentionally freezes gate parameters in
+        # this phase; delta/attention/TTF receive useful gradients first.  The
+        # learned gate starts training after warmup from its neutral prior.
+        warmup_active = (
+            self.training
+            and self.training_epoch < self.gate_warmup_epochs
+        )
+        if warmup_active:
+            variable_relevance = torch.full_like(
+                learned_relevance,
+                self.gate_warmup_value,
+            )
+        else:
+            variable_relevance = learned_relevance
 
         # The variable-time gate is now the sole learned rejection mechanism.
         # text_mask still guarantees exact identity when a sample has no text.
@@ -258,5 +304,6 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.last_variable_relevance = variable_relevance.detach()
         self.last_delta = delta_text.detach()
         self.last_correction = correction.detach()
+        self.last_gate_warmup_active = bool(warmup_active)
 
         return Y_out
