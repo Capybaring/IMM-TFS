@@ -1,9 +1,8 @@
-# BUILD_ID: staged-semantic-slot-gate-v7-20260829
+# BUILD_ID: objective-neutral-slot-gate-v8-20260829
 import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class FutureTime2Vec(nn.Module):
@@ -147,10 +146,6 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.last_text_mask = None
         self.last_context = None
         self.last_gate_warmup_active = False
-        self._gate_for_aux = None
-        self._candidate_correction_for_aux = None
-        self._base_prediction_for_aux = None
-        self._text_mask_for_aux = None
 
     def set_training_epoch(self, epoch: int) -> None:
         """Inform the fusion gate which training epoch is about to run."""
@@ -209,13 +204,19 @@ class MMF_VarTime_SlotGate(nn.Module):
                 f"Expected E_txt shape {(B, T, self.d_txt)}, "
                 f"got {tuple(E_txt.shape)}"
             )
+        if not torch.isfinite(Y_ts).all():
+            raise ValueError("Numerical forecast contains NaN or Inf values")
+        if not torch.isfinite(E_txt).all():
+            raise ValueError("Text features contain NaN or Inf values")
 
         t_hat = self._prepare_time(t_hat, B, T, Y_ts)
         has_text = M_txt.to(torch.bool).reshape(B, -1).any(dim=1)
         text_mask = has_text.view(B, 1, 1).to(Y_ts.dtype)
 
         E_slots = E_txt.reshape(B, T, self.semantic_slots, self.slot_dim)
-        slot_rms = E_slots.square().mean(dim=-1, keepdim=True).sqrt()
+        slot_rms = (
+            E_slots.float().square().mean(dim=-1, keepdim=True).sqrt()
+        ).to(E_slots.dtype)
         E_slots = self.slot_norm(E_slots) * slot_rms
 
         # Detach only the residual-query input.  The explicit addition at the
@@ -264,9 +265,9 @@ class MMF_VarTime_SlotGate(nn.Module):
         gate_logits = self.gate_net(interaction).squeeze(-1)
         learned_relevance = torch.sigmoid(gate_logits)
 
-        # Do not let the rejection gate kill an untrained residual.  During
-        # warmup, the forward gate stays constant and gate supervision is
-        # disabled.  The ungated candidate receives its own loss instead.
+        # Do not let the rejection gate kill an untrained residual.  The fixed
+        # forward gate lets the residual/attention/TTF path receive gradients
+        # before learned rejection begins, without any auxiliary objective.
         warmup_active = (
             self.training
             and self.training_epoch < self.gate_warmup_epochs
@@ -292,22 +293,6 @@ class MMF_VarTime_SlotGate(nn.Module):
         correction = gate * candidate_correction
         Y_out = Y_ts + correction
 
-        # Keep graph-connected tensors only during training.  The auxiliary
-        # target asks whether the ungated text candidate would reduce the local
-        # squared error relative to the numerical forecast.  This gives the
-        # gate an identifiable relevance objective instead of letting it trade
-        # scale arbitrarily with delta_text.
-        if self.training:
-            self._gate_for_aux = learned_relevance
-            self._candidate_correction_for_aux = candidate_correction
-            self._base_prediction_for_aux = Y_ts
-            self._text_mask_for_aux = text_mask
-        else:
-            self._gate_for_aux = None
-            self._candidate_correction_for_aux = None
-            self._base_prediction_for_aux = None
-            self._text_mask_for_aux = None
-
         # Preserve the old H+1 diagnostic shape by appending a zero-probability
         # NULL column.  This keeps evaluation entropy code valid when H == 1.
         diagnostic_attention = torch.cat(
@@ -329,53 +314,3 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.last_gate_warmup_active = bool(warmup_active)
 
         return Y_out
-
-    def gate_supervision_loss(
-        self,
-        target: torch.Tensor,
-        observed_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Train the gate only after the text candidate has learned."""
-        gate = self._gate_for_aux
-        candidate = self._candidate_correction_for_aux
-        base_prediction = self._base_prediction_for_aux
-        text_mask = self._text_mask_for_aux
-        if any(
-            value is None
-            for value in (gate, candidate, base_prediction, text_mask)
-        ):
-            return self.delta_out.weight.sum() * 0.0
-        if self.training_epoch < self.gate_warmup_epochs:
-            return gate.sum() * 0.0
-
-        with torch.no_grad():
-            base_error = (target - base_prediction).square()
-            candidate_error = (
-                target - (base_prediction + candidate)
-            ).square()
-            improvement = base_error - candidate_error
-            tie_tolerance = 1e-6 * (1.0 + base_error)
-            relevance_target = (improvement > 0).to(gate.dtype)
-            valid = (
-                observed_mask.to(torch.bool)
-                & text_mask.to(torch.bool)
-                & (improvement.abs() > tie_tolerance)
-            )
-
-        if not valid.any():
-            return gate.sum() * 0.0
-        return F.binary_cross_entropy(gate[valid], relevance_target[valid])
-
-    def candidate_prediction_for_loss(self) -> torch.Tensor | None:
-        """Return the ungated text prediction during candidate warmup."""
-        if (
-            not self.training
-            or self.training_epoch >= self.gate_warmup_epochs
-            or self._candidate_correction_for_aux is None
-            or self._base_prediction_for_aux is None
-        ):
-            return None
-        return (
-            self._base_prediction_for_aux.detach()
-            + self._candidate_correction_for_aux
-        )

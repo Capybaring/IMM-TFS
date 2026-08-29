@@ -29,12 +29,7 @@ MMF_SLOT_GATE_BIAS=0.0
 MMF_DELTA_INIT_STD=0.01
 FUSION_GATE_WARMUP_EPOCHS=5
 FUSION_GATE_WARMUP_VALUE=0.5
-FUSION_LR_MULTIPLIER=1.0
-FUSION_BASE_LOSS_WEIGHT=0.25
-FUSION_GATE_LOSS_WEIGHT=0.1
-SEMANTIC_ROUTING_LOSS_WEIGHT=0.01
-FUSION_CANDIDATE_LOSS_WEIGHT=0.25
-FUSION_WEIGHT_DECAY=0.0
+FUSION_LR_MULTIPLIER=2.0
 KAPPA=0.1
 
 usage() {
@@ -163,11 +158,6 @@ if [[ "$MODE" == "multi" ]]; then
         --fusion_gate_warmup_epochs "$FUSION_GATE_WARMUP_EPOCHS"
         --fusion_gate_warmup_value "$FUSION_GATE_WARMUP_VALUE"
         --fusion_lr_multiplier "$FUSION_LR_MULTIPLIER"
-        --fusion_base_loss_weight "$FUSION_BASE_LOSS_WEIGHT"
-        --fusion_gate_loss_weight "$FUSION_GATE_LOSS_WEIGHT"
-        --semantic_routing_loss_weight "$SEMANTIC_ROUTING_LOSS_WEIGHT"
-        --fusion_candidate_loss_weight "$FUSION_CANDIDATE_LOSS_WEIGHT"
-        --fusion_weight_decay "$FUSION_WEIGHT_DECAY"
         --kappa "$KAPPA"
     )
 fi

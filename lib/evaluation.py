@@ -73,21 +73,16 @@ def compute_all_losses(
     batch_dict,
     enable_text=True,
     use_text_embeddings=True,
-    fusion_base_loss_weight=0.0,
-    fusion_gate_loss_weight=0.0,
-    semantic_routing_loss_weight=0.0,
-    fusion_candidate_loss_weight=0.0,
 ):
-    base_pred = model.forecasting(
+    pred_y = model.forecasting(
         batch_dict["tp_to_predict"],
         batch_dict["observed_data"],
         batch_dict["observed_tp"],
         batch_dict["observed_mask"],
     )
-    if not torch.isfinite(base_pred).all():
+    if not torch.isfinite(pred_y).all():
         raise ValueError("Numerical prediction contains NaN or Inf")
 
-    pred_y = base_pred
     if enable_text and fusion is not None:
         notes_input = (
             batch_dict["notes_embeddings"]
@@ -113,73 +108,7 @@ def compute_all_losses(
     mse = compute_error(target, pred_y, mask, "MSE", "mean")
     if not torch.isfinite(mse):
         raise ValueError("MSE is NaN or Inf")
-
-    loss = mse
-    results = {"mse": mse.item()}
-    if enable_text and fusion is not None:
-        base_mse = compute_error(target, base_pred, mask, "MSE", "mean")
-        gate_loss_fn = getattr(
-            getattr(fusion, "mmf", None),
-            "gate_supervision_loss",
-            None,
-        )
-        routing_loss_fn = getattr(
-            getattr(fusion, "ttf", None),
-            "routing_loss",
-            None,
-        )
-        candidate_prediction_fn = getattr(
-            getattr(fusion, "mmf", None),
-            "candidate_prediction_for_loss",
-            None,
-        )
-        gate_loss = (
-            gate_loss_fn(target, mask)
-            if gate_loss_fn is not None
-            else mse.new_zeros(())
-        )
-        routing_loss = (
-            routing_loss_fn()
-            if routing_loss_fn is not None
-            else mse.new_zeros(())
-        )
-        candidate_prediction = (
-            candidate_prediction_fn()
-            if candidate_prediction_fn is not None
-            else None
-        )
-        candidate_mse = (
-            compute_error(
-                target,
-                candidate_prediction,
-                mask,
-                "MSE",
-                "mean",
-            )
-            if candidate_prediction is not None
-            else mse.new_zeros(())
-        )
-        base_weight = float(fusion_base_loss_weight)
-        loss = (
-            (1.0 - base_weight) * mse
-            + base_weight * base_mse
-            + float(fusion_gate_loss_weight) * gate_loss
-            + float(semantic_routing_loss_weight) * routing_loss
-            + float(fusion_candidate_loss_weight) * candidate_mse
-        )
-        results.update(
-            {
-                "base_mse": base_mse.item(),
-                "gate_loss": gate_loss.item(),
-                "routing_loss": routing_loss.item(),
-                "candidate_mse": candidate_mse.item(),
-            }
-        )
-
-    if not torch.isfinite(loss):
-        raise ValueError("Training loss is NaN or Inf")
-    results["loss"] = loss
-    return results
+    return {"loss": mse, "mse": mse.item()}
 
 
 def masked_mse_nn(pred_y, target, mask):

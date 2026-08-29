@@ -1,3 +1,4 @@
+# BUILD_ID: stable-semantic-slots-v8-20260829
 import math
 
 import torch
@@ -124,8 +125,6 @@ class TTF_SemTime_Slots(nn.Module):
         self.last_fused_weights = None
         self.last_absolute_recency_strength = None
         self.last_slot_outputs = None
-        self._routing_assignment = None
-        self._routing_note_mask = None
 
     @staticmethod
     def _masked_softmax(logits, valid_mask, dim=-1):
@@ -136,7 +135,11 @@ class TTF_SemTime_Slots(nn.Module):
         return weights / weights.sum(dim=dim, keepdim=True).clamp_min(1e-8)
 
     def _slot_consistency(self, semantic_weights, semantic_vectors, note_mask):
-        normalized = F.normalize(semantic_vectors, p=2, dim=-1, eps=1e-8)
+        # Routing statistics stay in float32 even when the surrounding model
+        # uses AMP; tiny slot masses must not underflow before division.
+        normalized = F.normalize(
+            semantic_vectors.float(), p=2, dim=-1, eps=1e-8
+        )
         pairwise = torch.einsum("bkd,bjd->bkj", normalized, normalized)
 
         valid_pairs = (
@@ -161,34 +164,6 @@ class TTF_SemTime_Slots(nn.Module):
             torch.ones_like(denom),
         )
         return consistency.clamp(0.0, 1.0)
-
-    def routing_loss(self) -> torch.Tensor:
-        """Encourage sharp per-note routing without collapsing one slot.
-
-        Entropy makes each note prefer one semantic slot.  The batch-level
-        balance term prevents the trivial solution in which every note picks
-        the same slot.  Both terms use only real notes.
-        """
-        if self._routing_assignment is None or self._routing_note_mask is None:
-            return self.slot_queries.sum() * 0.0
-
-        assignment = self._routing_assignment
-        valid_notes = self._routing_note_mask
-        valid_count = valid_notes.sum()
-        if valid_count == 0:
-            return assignment.sum() * 0.0
-
-        entropy = -(
-            assignment * assignment.clamp_min(1e-8).log()
-        ).sum(dim=1)
-        sharpness_loss = entropy[valid_notes].mean() / math.log(
-            self.semantic_slots
-        )
-
-        usage = assignment.sum(dim=(0, 2)) / valid_count.to(assignment.dtype)
-        uniform = torch.full_like(usage, 1.0 / self.semantic_slots)
-        balance_loss = self.semantic_slots * (usage - uniform).square().sum()
-        return sharpness_loss + 0.5 * balance_loss
 
     def forward(self, notes_input, tau: torch.Tensor, t_hat: torch.Tensor):
         if self.use_text_embeddings:
@@ -222,12 +197,18 @@ class TTF_SemTime_Slots(nn.Module):
 
         tau = tau.to(device=V.device, dtype=V.dtype)
         t_hat = t_hat.to(device=V.device, dtype=V.dtype)
+        if not torch.isfinite(t_hat).all():
+            raise ValueError("Future timestamps contain NaN or Inf values")
+        if note_mask.any() and not torch.isfinite(tau[note_mask]).all():
+            raise ValueError("Real-note timestamps contain NaN or Inf values")
+        # Padding timestamps carry no information.  Clearing them prevents a
+        # non-finite padding value from entering recency arithmetic before the
+        # note mask is applied.
+        tau = torch.where(note_mask, tau, torch.zeros_like(tau))
 
         T_f = t_hat.shape[1]
         M_txt = note_mask.any(dim=1, keepdim=True)
         if K == 0:
-            self._routing_assignment = None
-            self._routing_note_mask = None
             self.last_slot_assignment = None
             self.last_semantic_weights = None
             self.last_slot_mass = None
@@ -249,30 +230,17 @@ class TTF_SemTime_Slots(nn.Module):
             "hd,bkhd->bhk", self.slot_queries, keys
         ) / math.sqrt(self.slot_dim)
 
-        # During training, Gumbel noise breaks the exactly-uniform stationary
-        # point of entropy regularization.  Evaluation remains deterministic.
-        if self.training:
-            slot_assignment = F.gumbel_softmax(
-                slot_logits,
-                tau=self.assignment_temperature,
-                hard=False,
-                dim=1,
-            )
-        else:
-            slot_assignment = torch.softmax(
-                slot_logits / self.assignment_temperature,
-                dim=1,
-            )
-        slot_assignment = slot_assignment * note_mask[:, None, :].to(V.dtype)
-        if self.training:
-            self._routing_assignment = slot_assignment
-            self._routing_note_mask = note_mask
-        else:
-            self._routing_assignment = None
-            self._routing_note_mask = None
+        # Deterministic competitive routing keeps train/eval behavior aligned.
+        # Compute the softmax in float32 so low-precision training cannot
+        # create NaNs in the Gumbel sampling path used by the previous version.
+        slot_assignment = torch.softmax(
+            slot_logits.float() / self.assignment_temperature,
+            dim=1,
+        )
+        slot_assignment = slot_assignment * note_mask[:, None, :].float()
 
         raw_slot_mass = slot_assignment.sum(dim=-1)
-        valid_count = note_mask.sum(dim=-1, keepdim=True).to(V.dtype)
+        valid_count = note_mask.sum(dim=-1, keepdim=True).float()
         slot_mass = raw_slot_mass / valid_count.clamp_min(1.0)
 
         # Within each slot, normalize only over its assigned real notes.
@@ -302,11 +270,19 @@ class TTF_SemTime_Slots(nn.Module):
         learned_gate = torch.sigmoid(self.time_gate(gate_features).squeeze(-1))
         time_gate = disagreement * learned_gate * slot_mass
 
-        delta = (t_hat[:, :, None] - tau[:, None, :]).clamp_min(0.0)
-        sigma = self.log_recency_sigma.exp().clamp_min(1e-4)
+        delta = (
+            t_hat[:, :, None].float() - tau[:, None, :].float()
+        ).clamp_min(0.0)
+        # Bound the logarithm before exp().  clamp_min after exp() cannot stop
+        # overflow when the learned log-sigma becomes large.
+        sigma = self.log_recency_sigma.float().clamp(
+            min=math.log(1e-3),
+            max=math.log(1e3),
+        ).exp()
         time_logits = -(
             delta[:, None, :, :] / sigma[None, :, None, None]
         ).square()
+        time_logits = time_logits.clamp(min=-80.0, max=0.0)
         temporal_kernel = time_logits.exp()
 
         # log assignment retains cross-slot competition while softmax over K
@@ -322,7 +298,7 @@ class TTF_SemTime_Slots(nn.Module):
         fused_weights = self._masked_softmax(fused_logits, fused_mask, dim=-1)
 
         slot_outputs = torch.einsum(
-            "bhtk,bhkd->bhtd", fused_weights, values
+            "bhtk,bhkd->bhtd", fused_weights.to(values.dtype), values
         )
         slot_outputs = torch.stack(
             [

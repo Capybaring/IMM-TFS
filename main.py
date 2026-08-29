@@ -757,38 +757,8 @@ def get_args_from_parser() -> argparse.Namespace:
     parser.add_argument(
         "--fusion_lr_multiplier",
         type=float,
-        default=1.0,
+        default=2.0,
         help="Fusion-branch learning rate multiplier relative to --lr",
-    )
-    parser.add_argument(
-        "--fusion_base_loss_weight",
-        type=float,
-        default=0.25,
-        help="Mixture weight of direct backbone MSE in multimodal training",
-    )
-    parser.add_argument(
-        "--fusion_gate_loss_weight",
-        type=float,
-        default=0.1,
-        help="Weight of counterfactual text-relevance gate supervision",
-    )
-    parser.add_argument(
-        "--semantic_routing_loss_weight",
-        type=float,
-        default=0.01,
-        help="Weight of semantic-slot sharpness and balance regularization",
-    )
-    parser.add_argument(
-        "--fusion_candidate_loss_weight",
-        type=float,
-        default=0.25,
-        help="Weight of ungated text-candidate MSE during gate warmup",
-    )
-    parser.add_argument(
-        "--fusion_weight_decay",
-        type=float,
-        default=0.0,
-        help="Weight decay applied only to the fusion branch",
     )
     parser.add_argument(
         "--kappa",
@@ -872,16 +842,6 @@ def get_args_from_parser() -> argparse.Namespace:
         parser.error("--fusion_gate_warmup_value must be in (0, 1]")
     if args.fusion_lr_multiplier <= 0:
         parser.error("--fusion_lr_multiplier must be > 0")
-    if not 0.0 <= args.fusion_base_loss_weight < 1.0:
-        parser.error("--fusion_base_loss_weight must be in [0, 1)")
-    if args.fusion_gate_loss_weight < 0:
-        parser.error("--fusion_gate_loss_weight must be >= 0")
-    if args.semantic_routing_loss_weight < 0:
-        parser.error("--semantic_routing_loss_weight must be >= 0")
-    if args.fusion_candidate_loss_weight < 0:
-        parser.error("--fusion_candidate_loss_weight must be >= 0")
-    if args.fusion_weight_decay < 0:
-        parser.error("--fusion_weight_decay must be >= 0")
     if (
         args.enable_text
         and args.TTF_module == "TTF_SemTime_Slots"
@@ -1193,8 +1153,9 @@ def trainable(
     logger.info(input_command)
     logger.info(args)
 
-    # Preserve GPINet's original regularization, but keep the small fusion
-    # output heads free of L2 shrinkage while their task gradients are weak.
+    # This is the common optimizer protocol used by every TTF/MMF pair.
+    # GPINet keeps its original regularization; fusion uses the same 2x
+    # learning-rate multiplier and zero weight decay as the first comparison.
     model_parameters = list(model.parameters())
     fusion_parameters = list(fusion.parameters()) if fusion is not None else []
     trainable_parameters = model_parameters + fusion_parameters
@@ -1207,7 +1168,7 @@ def trainable(
                 },
                 {
                     "params": fusion_parameters,
-                    "weight_decay": args.fusion_weight_decay,
+                    "weight_decay": 0.0,
                     "lr": args.lr * args.fusion_lr_multiplier,
                 },
             ],
@@ -1323,10 +1284,6 @@ def trainable(
                                 batch_dict,
                                 args.enable_text,
                                 args.use_text_embeddings,
-                                args.fusion_base_loss_weight,
-                                args.fusion_gate_loss_weight,
-                                args.semantic_routing_loss_weight,
-                                args.fusion_candidate_loss_weight,
                             )
                             loss = train_res["loss"]
                         scaler.scale(loss).backward()
@@ -1343,10 +1300,6 @@ def trainable(
                             batch_dict,
                             args.enable_text,
                             args.use_text_embeddings,
-                            args.fusion_base_loss_weight,
-                            args.fusion_gate_loss_weight,
-                            args.semantic_routing_loss_weight,
-                            args.fusion_candidate_loss_weight,
                         )
                         loss = train_res["loss"]
                         loss.backward()
