@@ -96,13 +96,13 @@ def get_args_from_parser() -> argparse.Namespace:
         dest="n",
         type=int,
         default=int(1e8),
-        help="Number of MIMIC training subjects",
+        help="Total MIMIC subjects to sample before a 60/20/20 split",
     )
     parser.add_argument(
         "--data_seed",
         type=int,
         default=42,
-        help="Seed for independently sampling MIMIC training subjects",
+        help="Seed for independently sampling each MIMIC cohort size",
     )
     parser.add_argument(
         "--split_method",

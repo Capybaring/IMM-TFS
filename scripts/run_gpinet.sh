@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Command-line interface: only mode, training-subject count, and model seed.
+# Command-line interface: only mode, total-subject count, and model seed.
 MODE="uni"
-TRAIN_N=1000
+TOTAL_N=1000
 MODEL_SEED=1
 
 # Edit the remaining experiment settings directly here.
@@ -39,7 +39,7 @@ Usage:
 
 Options:
   --mode MODE  Experiment mode: uni or multi (default: uni)
-  --num N      Number of independently sampled training subjects (default: 1000)
+  --num N      Total subjects before the 60/20/20 split (default: 1000)
   --seed N     Model seed (default: 1)
   -h, --help   Show this help
 
@@ -50,7 +50,7 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --mode) MODE="$2"; shift 2 ;;
-        --num) TRAIN_N="$2"; shift 2 ;;
+        --num) TOTAL_N="$2"; shift 2 ;;
         --seed) MODEL_SEED="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -61,7 +61,7 @@ case "$MODE" in
     uni|multi) ;;
     *) echo "--mode must be uni or multi" >&2; exit 2 ;;
 esac
-[[ "$TRAIN_N" =~ ^[1-9][0-9]*$ ]] || {
+[[ "$TOTAL_N" =~ ^[1-9][0-9]*$ ]] || {
     echo "--num must be a positive integer" >&2
     exit 2
 }
@@ -75,7 +75,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
 ensure_embeddings() {
-    python - "$TRAIN_N" "$DATA_SEED" <<'PY'
+    python - "$TOTAL_N" "$DATA_SEED" <<'PY'
 import sys
 
 import torch
@@ -85,7 +85,7 @@ from lib.parse_datasets import select_mimic_subject_records
 
 selection = select_mimic_subject_records(
     "data/MIMIC",
-    requested_train_n=int(sys.argv[1]),
+    requested_total_n=int(sys.argv[1]),
     data_seed=int(sys.argv[2]),
 )
 compute_text_embeddings(
@@ -133,7 +133,7 @@ cmd=(
     --node_dim 10
     --hid_dim 64
     --dropout 0.3
-    --num "$TRAIN_N"
+    --num "$TOTAL_N"
 )
 
 if [[ "$MODE" == "multi" ]]; then
@@ -165,9 +165,9 @@ fi
 
 mkdir -p "$OUTPUT_DIR"
 timestamp="$(date '+%Y%m%d_%H%M%S')"
-log_file="$OUTPUT_DIR/gpinet_n${TRAIN_N}_${MODE}_seed${MODEL_SEED}_${timestamp}.log"
+log_file="$OUTPUT_DIR/gpinet_n${TOTAL_N}_${MODE}_seed${MODEL_SEED}_${timestamp}.log"
 
-echo "### GPINet mode=$MODE num=$TRAIN_N model_seed=$MODEL_SEED data_seed=$DATA_SEED"
+echo "### GPINet mode=$MODE num=$TOTAL_N model_seed=$MODEL_SEED data_seed=$DATA_SEED"
 set +e
 "${cmd[@]}" 2>&1 | tee >(filter_final_log > "$log_file")
 status=${PIPESTATUS[0]}

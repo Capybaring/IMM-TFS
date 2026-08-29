@@ -14,9 +14,9 @@ Key differences from the original generic loader:
 1. no sliding-window re-chunking for expanded MIMIC;
 2. preserve the synthetic episode anchor (e.g. 2000-01-01 00:00:00);
 3. split at subject level before normalization;
-4. validation/test subjects are fixed across data sizes;
-5. each Train_N is sampled independently from the fixed training pool;
-6. normalization is fitted on the selected Train_N history only;
+4. each requested total cohort is sampled independently;
+5. every cohort is split by subject into 60% train, 20% validation and 20% test;
+6. normalization is fitted on that cohort's training history only;
 7. dataset tensors stay on CPU; only mini-batches move to GPU;
 8. text exposes both:
        tau_raw : raw dataset units (hours for MIMIC)
@@ -553,11 +553,11 @@ def _records_for_subjects(subjects, subject_to_records):
 
 def select_mimic_subject_records(
     dataset_path: str,
-    requested_train_n: int,
+    requested_total_n: int,
     data_seed: int = 42,
     split_seed: int = 42,
 ):
-    """Select one independent Train_N and fixed validation/test subjects."""
+    """Sample one independent N-subject cohort, then split it 60/20/20."""
     proc_dir = os.path.join(dataset_path, "processed")
     if not os.path.isdir(proc_dir):
         raise FileNotFoundError(f"Processed directory not found: {proc_dir}")
@@ -578,50 +578,53 @@ def select_mimic_subject_records(
         subject_to_records.setdefault(subject, []).append(record_id)
 
     subjects = sorted(subject_to_records)
-    if len(subjects) < 5:
+    if requested_total_n <= 0:
+        raise ValueError("--num must be a positive total-subject count")
+    if data_seed < 0:
+        raise ValueError("data_seed must be non-negative")
+    if split_seed < 0:
+        raise ValueError("split_seed must be non-negative")
+
+    cohort_n = min(int(requested_total_n), len(subjects))
+    if requested_total_n > len(subjects):
+        print(
+            f"[ExpandedMIMIC][WARN] requested --num {requested_total_n:,} "
+            f"exceeds the full cohort {len(subjects):,}; using all subjects."
+        )
+    if cohort_n < 5:
         raise ValueError(
-            f"Need more subjects for a 60/20/20 split; got {len(subjects)}"
+            f"--num must select at least 5 subjects for a 60/20/20 split; "
+            f"got {cohort_n}"
         )
 
+    # Include N in the seed so different requested scales are independent
+    # samples rather than prefixes of one permutation. Uni and Multi remain
+    # paired because the same (N, data_seed) always selects the same cohort.
+    rng = np.random.default_rng(np.random.SeedSequence([data_seed, cohort_n]))
+    cohort_subjects = sorted(
+        map(
+            str,
+            rng.choice(subjects, size=cohort_n, replace=False).tolist(),
+        )
+    )
+
     trainval_subjects, test_subjects = train_test_split(
-        subjects,
+        cohort_subjects,
         train_size=0.8,
         random_state=split_seed,
         shuffle=True,
     )
-    train_pool, val_subjects = train_test_split(
+    train_subjects, val_subjects = train_test_split(
         trainval_subjects,
         train_size=0.75,
         random_state=split_seed,
         shuffle=True,
     )
-    train_pool = sorted(map(str, train_pool))
+    train_subjects = sorted(map(str, train_subjects))
     val_subjects = sorted(map(str, val_subjects))
     test_subjects = sorted(map(str, test_subjects))
 
-    if requested_train_n <= 0:
-        raise ValueError("--num must be a positive TRAIN-subject count")
-    if data_seed < 0:
-        raise ValueError("data_seed must be non-negative")
-
-    train_n = min(int(requested_train_n), len(train_pool))
-    if requested_train_n > len(train_pool):
-        print(
-            f"[ExpandedMIMIC][WARN] requested --num {requested_train_n:,} exceeds "
-            f"the training pool {len(train_pool):,}; using all subjects."
-        )
-
-    # Include N in the seed so different sizes are independent samples instead
-    # of prefixes of one shared permutation. Uni and Multi remain paired because
-    # the same (N, data_seed) always produces the same subjects.
-    rng = np.random.default_rng(np.random.SeedSequence([data_seed, train_n]))
-    selected_subjects = sorted(
-        map(
-            str,
-            rng.choice(train_pool, size=train_n, replace=False).tolist(),
-        )
-    )
-    train_records = _records_for_subjects(selected_subjects, subject_to_records)
+    train_records = _records_for_subjects(train_subjects, subject_to_records)
     val_records = _records_for_subjects(val_subjects, subject_to_records)
     test_records = _records_for_subjects(test_subjects, subject_to_records)
 
@@ -635,11 +638,12 @@ def select_mimic_subject_records(
 
     return {
         "subject_count": len(subjects),
-        "train_pool_count": len(train_pool),
-        "train_n": train_n,
+        "cohort_n": cohort_n,
+        "train_n": len(train_subjects),
         "data_seed": int(data_seed),
         "split_seed": int(split_seed),
-        "train_subjects": selected_subjects,
+        "cohort_subjects": cohort_subjects,
+        "train_subjects": train_subjects,
         "val_subjects": val_subjects,
         "test_subjects": test_subjects,
         "train_records": train_records,
@@ -994,11 +998,11 @@ def parse_datasets(args, show_summary=True):
     data_seed = int(getattr(args, "data_seed", 42))
     selection = select_mimic_subject_records(
         dataset_path=dataset_path,
-        requested_train_n=int(getattr(args, "n", int(1e8))),
+        requested_total_n=int(getattr(args, "n", int(1e8))),
         data_seed=data_seed,
     )
 
-    # Load only the independently sampled Train_N and fixed validation/test.
+    # Load only this independently sampled cohort's 60/20/20 split.
     old_rec_ids = getattr(args, "rec_ids", None)
     args.rec_ids = selection["required_records"]
     try:
@@ -1043,17 +1047,18 @@ def parse_datasets(args, show_summary=True):
     ds.fit_and_apply_train_history_normalization(train_idx)
 
     print("=" * 72)
-    print("Expanded MIMIC independent-size experiment")
+    print("Expanded MIMIC per-scale 60/20/20 experiment")
     print("=" * 72)
     print(f"full cohort subjects   : {selection['subject_count']:,}")
-    print(f"full train pool        : {selection['train_pool_count']:,}")
+    print(f"experiment subjects    : {selection['cohort_n']:,}")
     print(f"TRAIN subjects used    : {selection['train_n']:,}")
-    print(f"VAL subjects fixed     : {len(selection['val_subjects']):,}")
-    print(f"TEST subjects fixed    : {len(selection['test_subjects']):,}")
+    print(f"VAL subjects used      : {len(selection['val_subjects']):,}")
+    print(f"TEST subjects used     : {len(selection['test_subjects']):,}")
     print(f"data seed              : {selection['data_seed']}")
-    print("train sampling         : independent for each N")
-    print("normalization          : selected Train_N history only")
-    print("--num semantics        : TRAIN SUBJECT COUNT")
+    print("cohort sampling        : independent for each N")
+    print("split                  : 60% train / 20% val / 20% test")
+    print("normalization          : current cohort's train history only")
+    print("--num semantics        : TOTAL SUBJECT COUNT")
     print("=" * 72)
 
     all_chunks = ds.chunks
@@ -1114,14 +1119,16 @@ def parse_datasets(args, show_summary=True):
         "normalization": ds.normalization_dict(),
     }
     out["data_selection"] = {
+        "cohort_n": selection["cohort_n"],
         "train_n": selection["train_n"],
         "data_seed": selection["data_seed"],
         "split_seed": selection["split_seed"],
+        "cohort_subjects": list(selection["cohort_subjects"]),
         "train_subjects": list(selection["train_subjects"]),
         "train_records": list(selection["train_records"]),
         "val_records": list(selection["val_records"]),
         "test_records": list(selection["test_records"]),
-        "normalization_scope": "selected Train_N history only",
+        "normalization_scope": "current cohort's train history only",
     }
     return out
 
