@@ -1,8 +1,8 @@
 """
-Expanded-MIMIC adapter for IMM-TFS (v4 fixed/nested protocol capable).
+Standalone expanded-MIMIC loader for IMM-TFS (v4 fixed/nested protocol).
 
-This adapter is intentionally scoped to dataset names starting with "MIMIC".
-All non-MIMIC datasets are delegated to the original lib.parse_datasets.
+This module contains its own collate functions and does not depend on the
+original TIME-IMM lib.parse_datasets module.
 
 Expanded MIMIC assumptions
 --------------------------
@@ -49,14 +49,7 @@ from sklearn.model_selection import train_test_split
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset, Subset
 
-from lib.parse_datasets import (
-    get_input_and_pred_len as _original_get_input_and_pred_len,
-    parse_datasets as _original_parse_datasets,
-    patch_variable_time_collate_fn,
-    variable_time_collate_fn,
-    variable_time_collate_fn_CRU,
-    variable_time_collate_fn_ODE,
-)
+import lib.utils as utils
 
 
 UNIT_SECONDS = {
@@ -66,10 +59,6 @@ UNIT_SECONDS = {
     "days": 86400.0,
     "weeks": 604800.0,
 }
-
-
-def _is_expanded_mimic(dataset_name: str) -> bool:
-    return str(dataset_name).upper().startswith("MIMIC")
 
 
 def _resolve_dataset_path(args: argparse.Namespace) -> str:
@@ -804,6 +793,219 @@ def _fixed_nested_selection(protocol, requested_train_n: int):
     return train_n, selected_subjects, train_records, val_records, test_records, required_records
 
 
+def variable_time_collate_fn(batch, args, time_max=None):
+    observed_tp, observed_data, observed_mask = [], [], []
+    predicted_tp, predicted_data, predicted_mask = [], [], []
+    chunk_time_max = (
+        time_max
+        if time_max is not None
+        else torch.tensor(args.history + args.pred_window).to(args.device)
+    )
+
+    for _, tt, vals, mask in batch:
+        hist_idx = torch.where(tt < args.history)[0]
+        pred_idx = torch.where(tt >= args.history)[0]
+        if mask[pred_idx].sum() == 0:
+            raise ValueError(
+                "Mask for batch is all zeros in collate_fn, "
+                f"predicted index: {pred_idx}"
+            )
+        observed_tp.append(tt[hist_idx])
+        observed_data.append(vals[hist_idx])
+        observed_mask.append(mask[hist_idx])
+        predicted_tp.append(tt[pred_idx])
+        predicted_data.append(vals[pred_idx])
+        predicted_mask.append(mask[pred_idx])
+
+    observed_tp = pad_sequence(observed_tp, batch_first=True, padding_value=0.0)
+    observed_data = pad_sequence(observed_data, batch_first=True, padding_value=0.0)
+    observed_mask = pad_sequence(observed_mask, batch_first=True, padding_value=0.0)
+    predicted_tp = pad_sequence(predicted_tp, batch_first=True, padding_value=0.0)
+    predicted_data = pad_sequence(predicted_data, batch_first=True, padding_value=0.0)
+    predicted_mask = pad_sequence(predicted_mask, batch_first=True, padding_value=0.0)
+
+    observed_tp = utils.normalize_masked_tp(
+        observed_tp, att_min=0.0, att_max=chunk_time_max
+    )
+    predicted_tp = utils.normalize_masked_tp(
+        predicted_tp, att_min=0.0, att_max=chunk_time_max
+    )
+    return {
+        "observed_data": observed_data,
+        "observed_tp": observed_tp,
+        "observed_mask": observed_mask,
+        "data_to_predict": predicted_data,
+        "tp_to_predict": predicted_tp,
+        "mask_predicted_data": predicted_mask,
+    }
+
+
+def patch_variable_time_collate_fn(batch, args, time_max=None):
+    if not batch:
+        return None
+
+    dim = batch[0][2].shape[1]
+    chunk_time_max = (
+        time_max
+        if time_max is not None
+        else torch.tensor(args.history + args.pred_window).to(args.device)
+    )
+    obs_tps, obs_vals, obs_masks = [], [], []
+    pred_tps, pred_vals, pred_masks = [], [], []
+
+    for _, tt, vals, mask in batch:
+        hist_idx = torch.where(tt < args.history)[0]
+        pred_idx = torch.where(tt >= args.history)[0]
+        obs_tps.append(tt[hist_idx])
+        obs_vals.append(vals[hist_idx])
+        obs_masks.append(mask[hist_idx])
+        pred_tps.append(tt[pred_idx])
+        pred_vals.append(vals[pred_idx])
+        pred_masks.append(mask[pred_idx])
+
+    predicted_tp = pad_sequence(pred_tps, batch_first=True, padding_value=0.0)
+    predicted_data = pad_sequence(pred_vals, batch_first=True, padding_value=0.0)
+    predicted_mask = pad_sequence(pred_masks, batch_first=True, padding_value=0.0)
+
+    non_empty = [t for t in obs_tps if len(t) > 0]
+    if non_empty:
+        combined_tt, inverse_indices = torch.unique(
+            torch.cat(non_empty), sorted=True, return_inverse=True
+        )
+        n_points = len(combined_tt)
+    else:
+        combined_tt = torch.tensor([], device=args.device)
+        inverse_indices = torch.tensor([], dtype=torch.long, device=args.device)
+        n_points = 0
+
+    batch_size = len(batch)
+    combined_vals = torch.zeros(batch_size, n_points, dim, device=args.device)
+    combined_mask = torch.zeros(batch_size, n_points, dim, device=args.device)
+    offset = 0
+    for index, time_points in enumerate(obs_tps):
+        if len(time_points) > 0:
+            positions = inverse_indices[offset : offset + len(time_points)]
+            combined_vals[index, positions] = obs_vals[index]
+            combined_mask[index, positions] = obs_masks[index]
+            offset += len(time_points)
+
+    combined_tt_normalized = utils.normalize_masked_tp(
+        combined_tt, att_min=0.0, att_max=chunk_time_max
+    )
+    predicted_tp = utils.normalize_masked_tp(
+        predicted_tp, att_min=0.0, att_max=chunk_time_max
+    )
+
+    patch_indices = []
+    for index in range(args.npatch):
+        start = index * args.patch_stride
+        end = start + args.patch_size
+        if index == args.npatch - 1:
+            in_patch = (combined_tt >= start) & (combined_tt < args.history)
+        else:
+            in_patch = (combined_tt >= start) & (combined_tt < end)
+        patch_indices.append(torch.where(in_patch)[0])
+
+    data_dict = {
+        "data": combined_vals,
+        "time_steps": combined_tt_normalized,
+        "mask": combined_mask,
+        "data_to_predict": predicted_data,
+        "tp_to_predict": predicted_tp,
+        "mask_predicted_data": predicted_mask,
+    }
+    return utils.split_and_patch_batch(
+        data_dict, args, n_points, patch_indices
+    )
+
+
+def variable_time_collate_fn_CRU(batch, args, time_max=None):
+    del time_max
+    observed_tp, observed_data, observed_mask = [], [], []
+    predicted_tp, predicted_data, predicted_mask = [], [], []
+
+    for _, tt, vals, mask in batch:
+        hist_idx = torch.where(tt < args.history)[0]
+        pred_idx = torch.where(tt >= args.history)[0]
+        observed_tp.append(tt[hist_idx])
+        observed_data.append(vals[hist_idx])
+        observed_mask.append(mask[hist_idx])
+        predicted_tp.append(tt[pred_idx])
+        predicted_data.append(vals[pred_idx])
+        predicted_mask.append(mask[pred_idx])
+
+    return {
+        "observed_data": pad_sequence(
+            observed_data, batch_first=True, padding_value=0.0
+        ),
+        "observed_tp": pad_sequence(
+            observed_tp, batch_first=True, padding_value=0.0
+        ),
+        "observed_mask": pad_sequence(
+            observed_mask, batch_first=True, padding_value=0.0
+        ),
+        "data_to_predict": pad_sequence(
+            predicted_data, batch_first=True, padding_value=0.0
+        ),
+        "tp_to_predict": pad_sequence(
+            predicted_tp, batch_first=True, padding_value=0.0
+        ),
+        "mask_predicted_data": pad_sequence(
+            predicted_mask, batch_first=True, padding_value=0.0
+        ),
+    }
+
+
+def variable_time_collate_fn_ODE(batch, args, time_max=None):
+    all_tt = torch.cat([tt for _, tt, _, _ in batch])
+    combined_tt_raw, inverse_indices = torch.unique(
+        all_tt, sorted=True, return_inverse=True
+    )
+    n_observed = torch.lt(combined_tt_raw, args.history).sum().item()
+
+    batch_size = len(batch)
+    dim = batch[0][2].size(-1)
+    n_points = combined_tt_raw.size(0)
+    combined_vals = torch.zeros(
+        batch_size, n_points, dim, device=args.device
+    )
+    combined_mask = torch.zeros(
+        batch_size, n_points, dim, device=args.device
+    )
+
+    offset = 0
+    for index, (_, tt, vals, mask) in enumerate(batch):
+        length = tt.size(0)
+        positions = inverse_indices[offset : offset + length]
+        combined_vals[index, positions] = vals.to(args.device)
+        combined_mask[index, positions] = mask.to(args.device)
+        offset += length
+
+    cap = (
+        time_max
+        if time_max is not None
+        else torch.tensor(
+            args.history + args.pred_window, device=args.device
+        )
+    )
+    combined_tt = utils.normalize_masked_tp(
+        combined_tt_raw, att_min=0.0, att_max=cap
+    )
+
+    eps = torch.finfo(combined_tt.dtype).eps * cap
+    indices = torch.arange(combined_tt.size(0), device=combined_tt.device)
+    combined_tt = combined_tt + indices * eps
+
+    return {
+        "observed_data": combined_vals[:, :n_observed, :],
+        "observed_tp": combined_tt[:n_observed],
+        "observed_mask": combined_mask[:, :n_observed, :],
+        "data_to_predict": combined_vals[:, n_observed:, :],
+        "tp_to_predict": combined_tt[n_observed:],
+        "mask_predicted_data": combined_mask[:, n_observed:, :],
+    }
+
+
 def _choose_base_collate(args):
     if args.model == "tPatchGNN":
         args.patch_size = args.patch_size or args.history // 5
@@ -915,9 +1117,12 @@ def _make_gpu_batch_collate(base_collate, args, time_max):
 
 
 def parse_datasets(args, show_summary=True):
-    """Drop-in parser with optional v4 fixed/nested MIMIC protocol."""
-    if not _is_expanded_mimic(args.dataset):
-        return _original_parse_datasets(args, show_summary=show_summary)
+    """Parse the standalone expanded-MIMIC dataset."""
+    if not str(args.dataset).upper().startswith("MIMIC"):
+        raise ValueError(
+            "parse_datasets_mimic_expanded only supports MIMIC datasets; "
+            f"got {args.dataset!r}"
+        )
 
     dataset_path = _resolve_dataset_path(args)
     print(f"Using expanded MIMIC dataset path: {dataset_path}")
@@ -1143,8 +1348,8 @@ def parse_datasets(args, show_summary=True):
 
 
 def get_input_and_pred_len(data_obj):
-    """Avoid the original full extra dataloader scan for expanded MIMIC."""
+    """Return the precomputed maximum history and prediction lengths."""
     ds = data_obj.get("ds")
-    if isinstance(ds, ExpandedMIMICDataset):
-        return ds.max_input_len, ds.max_pred_len
-    return _original_get_input_and_pred_len(data_obj)
+    if not isinstance(ds, ExpandedMIMICDataset):
+        raise TypeError("Expected ExpandedMIMICDataset in data_obj['ds']")
+    return ds.max_input_len, ds.max_pred_len
