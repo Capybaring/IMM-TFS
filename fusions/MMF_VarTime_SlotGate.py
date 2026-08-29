@@ -1,4 +1,4 @@
-# BUILD_ID: zero-safe-slot-gate-v9-20260829
+# BUILD_ID: active-slot-null-routing-v10-20260829
 import math
 
 import torch
@@ -20,14 +20,13 @@ class FutureTime2Vec(nn.Module):
 
 
 class MMF_VarTime_SlotGate(nn.Module):
-    """Variable-time residual fusion over semantic text slots.
+    """Variable-time residual fusion with active-slot/NULL routing.
 
-    Real-slot attention selects text content; the variable-time relevance gate
-    rejects unhelpful text.  During a short training warmup the gate is held at
-    a non-zero value so the residual and TTF branches can learn before the gate
-    is allowed to close.  This avoids the multiplicative cold start
-    ``correction = kappa * gate * delta`` that previously drove every gate to
-    approximately zero.
+    Each variable-time query chooses among the semantic slots that are actually
+    populated for the current patient plus a learned NULL/no-match option.
+    Empty slots never participate in attention.  After a short warmup,
+    ``1 - p(NULL)`` is the sole text-relevance factor; there is no independent
+    gate network competing with the residual branch for the same role.
 
     Shapes:
         Y_ts:  (B, T, C)
@@ -49,7 +48,7 @@ class MMF_VarTime_SlotGate(nn.Module):
         delta_init_std: float = 1e-2,
         gate_warmup_epochs: int = 5,
         gate_warmup_value: float = 0.5,
-        null_logit_bias: float = 1.0,
+        null_logit_bias: float | None = None,
     ):
         super().__init__()
 
@@ -91,9 +90,10 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.gate_warmup_epochs = int(gate_warmup_epochs)
         self.gate_warmup_value = float(gate_warmup_value)
         self.training_epoch = 0
-        # Retained only for constructor compatibility with older runners and
-        # checkpoints.  NULL no longer participates in attention or gating.
-        del null_logit_bias
+        # Reuse the existing runner knob for backward-compatible experiment
+        # configuration: mmf_slot_gate_bias now initializes the NULL logit.
+        if null_logit_bias is None:
+            null_logit_bias = float(gate_bias)
 
         self.local_value_proj = nn.Linear(1, self.d_attn, bias=False)
         self.global_state_proj = nn.Linear(self.C, self.d_attn, bias=False)
@@ -112,17 +112,17 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.slot_key = nn.Linear(self.slot_dim, self.d_attn, bias=False)
         self.slot_value = nn.Linear(self.slot_dim, self.d_attn, bias=False)
 
-        self.gate_net = nn.Sequential(
-            nn.Linear(4 * self.d_attn, self.d_attn),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(self.d_attn, 1),
+        # NULL participates in the same dot-product classification as the real
+        # semantic slots.  Its value is implicitly zero; only its key and bias
+        # are learned.  Query dependence makes NULL selection variable- and
+        # future-time-specific rather than a global rejection scalar.
+        self.null_key = nn.Parameter(
+            torch.randn(self.d_attn) * 0.02
         )
-        # A small non-zero weight lets gate decisions depend on text/numeric
-        # interactions as soon as warmup ends.  A zero final layer made every
-        # patient, variable and future time start with the same gate.
-        nn.init.normal_(self.gate_net[-1].weight, mean=0.0, std=1e-2)
-        nn.init.constant_(self.gate_net[-1].bias, float(gate_bias))
+        self.null_logit_bias = nn.Parameter(
+            torch.tensor(float(null_logit_bias), dtype=torch.float32)
+        )
+        self.supports_null_diagnostic = True
 
         self.delta_hidden = nn.Sequential(
             nn.Linear(2 * self.d_attn, self.d_attn, bias=False),
@@ -145,6 +145,7 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.last_candidate_correction = None
         self.last_text_mask = None
         self.last_context = None
+        self.last_active_slot_mask = None
         self.last_gate_warmup_active = False
 
     def set_training_epoch(self, epoch: int) -> None:
@@ -214,6 +215,10 @@ class MMF_VarTime_SlotGate(nn.Module):
         text_mask = has_text.view(B, 1, 1).to(Y_ts.dtype)
 
         E_slots = E_txt.reshape(B, T, self.semantic_slots, self.slot_dim)
+        # TTF writes an exactly zero vector for an unpopulated semantic slot.
+        # Record activity before normalization so empty slots can be excluded
+        # from the categorical correspondence decision.
+        active_slots = E_slots.float().square().sum(dim=-1) > 1e-12
         # Strict TTF routing can produce exactly empty (all-zero) slots.  The
         # derivative of sqrt(x) is singular at x=0, so the previous RMS
         # restoration created a finite forward value but a NaN backward
@@ -252,27 +257,57 @@ class MMF_VarTime_SlotGate(nn.Module):
         scores = torch.einsum(
             "btchd,btshd->btchs", q_heads, k_heads
         ) / math.sqrt(self.head_dim)
-        attention = torch.softmax(scores, dim=-1)
+
+        # Empty real slots are invalid classes.  NULL is always valid, so even
+        # a sample with no active slots has a well-defined softmax result.
+        active_slot_mask = active_slots[:, :, None, None, :]
+        real_scores = scores.float().masked_fill(
+            ~active_slot_mask,
+            -1e4,
+        )
+        null_key_heads = self.null_key.reshape(
+            self.n_heads,
+            self.head_dim,
+        ).float()
+        null_scores = torch.einsum(
+            "btchd,hd->btch",
+            q_heads.float(),
+            null_key_heads,
+        ) / math.sqrt(self.head_dim)
+        null_scores = null_scores + self.null_logit_bias.float()
+        all_scores = torch.cat(
+            [real_scores, null_scores.unsqueeze(-1)],
+            dim=-1,
+        )
+        all_attention = torch.softmax(all_scores, dim=-1)
+        real_attention = all_attention[..., :slot_count]
+        real_attention = real_attention * active_slot_mask.to(
+            real_attention.dtype
+        )
+        null_attention = all_attention[..., slot_count]
+
+        # Separate correspondence from relevance.  Conditional real-slot
+        # attention answers "which active slot?"; NULL mass answers "does any
+        # active slot correspond at all?".  This avoids attenuating the text
+        # context twice.
+        conditional_attention = real_attention / real_attention.sum(
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(1e-8)
 
         context_heads = torch.einsum(
-            "btchs,btshd->btchd", attention, v_heads
+            "btchs,btshd->btchd",
+            conditional_attention.to(v_heads.dtype),
+            v_heads,
         )
         context = context_heads.reshape(B, T, C, self.d_attn)
 
-        # Kept as an all-zero diagnostic for compatibility with the existing
-        # evaluation output.  It is not part of the forward computation.
-        null_probability = Y_ts.new_zeros(B, T, C)
+        null_probability = null_attention.mean(dim=-1).to(Y_ts.dtype)
+        learned_relevance = (1.0 - null_probability).clamp(0.0, 1.0)
 
-        interaction = torch.cat(
-            [query, context, query * context, torch.abs(query - context)],
-            dim=-1,
-        )
-        gate_logits = self.gate_net(interaction).squeeze(-1)
-        learned_relevance = torch.sigmoid(gate_logits)
-
-        # Do not let the rejection gate kill an untrained residual.  The fixed
-        # forward gate lets the residual/attention/TTF path receive gradients
-        # before learned rejection begins, without any auxiliary objective.
+        # Preserve the existing protected warmup: real-slot correspondence and
+        # the residual branch can learn before NULL relevance controls the
+        # correction magnitude.  No external objective or schedule changes.
         warmup_active = (
             self.training
             and self.training_epoch < self.gate_warmup_epochs
@@ -285,8 +320,9 @@ class MMF_VarTime_SlotGate(nn.Module):
         else:
             variable_relevance = learned_relevance
 
-        # The variable-time gate is now the sole learned rejection mechanism.
-        # text_mask still guarantees exact identity when a sample has no text.
+        # ``gate`` is kept as a diagnostic/API name.  It is no longer produced
+        # by a separate network; it is exactly the non-NULL correspondence
+        # probability (or the fixed warmup value) under the sample text mask.
         gate = variable_relevance * text_mask
 
         delta_features = torch.cat([context, query * context], dim=-1)
@@ -298,15 +334,7 @@ class MMF_VarTime_SlotGate(nn.Module):
         correction = gate * candidate_correction
         Y_out = Y_ts + correction
 
-        # Preserve the old H+1 diagnostic shape by appending a zero-probability
-        # NULL column.  This keeps evaluation entropy code valid when H == 1.
-        diagnostic_attention = torch.cat(
-            [
-                attention.mean(dim=-2),
-                null_probability.unsqueeze(-1),
-            ],
-            dim=-1,
-        )
+        diagnostic_attention = all_attention.mean(dim=-2).to(Y_ts.dtype)
         self.last_slot_attention = diagnostic_attention.detach()
         self.last_null_probability = null_probability.detach()
         self.last_gate = gate.detach()
@@ -316,6 +344,7 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.last_candidate_correction = candidate_correction.detach()
         self.last_text_mask = text_mask.detach()
         self.last_context = context.detach()
+        self.last_active_slot_mask = active_slots.detach()
         self.last_gate_warmup_active = bool(warmup_active)
 
         return Y_out
