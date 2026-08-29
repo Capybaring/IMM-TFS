@@ -1,4 +1,4 @@
-# BUILD_ID: bounded-strict-semantic-slots-v11-20260829
+# BUILD_ID: online-spherical-semantic-slots-v12-20260829
 import math
 
 import torch
@@ -9,12 +9,15 @@ from fusions.load_llm import embed_notes, get_d_model, load_llm
 
 
 class TTF_SemTime_Slots(nn.Module):
-    """Strict semantic classification followed by slot-local aggregation.
+    """Online semantic clustering followed by strict slot-local aggregation.
 
-    Every real note is assigned to exactly one slot in the forward pass.  Slot
-    decisions use shared semantic keys and distinct global prototypes, so a
-    slot never aggregates a note classified into another slot.  A
-    straight-through estimator preserves gradients through the hard decision.
+    Slot prototypes are initialized from training-note embeddings with
+    deterministic spherical farthest-point seeding, then updated by an EMA of
+    their assigned notes.  Routing is therefore learned from text semantics
+    without adding an auxiliary loss to the forecasting objective.  Every
+    accepted note belongs to exactly one slot; low-confidence notes can be
+    rejected instead of being forced into an unrelated class.  Prototypes are
+    frozen automatically in validation and test mode.
 
     Relative note weights alone cannot make a single report become stale: a
     softmax over one report is always one.  This implementation therefore also
@@ -41,6 +44,11 @@ class TTF_SemTime_Slots(nn.Module):
         time_gate_bias: float = -1.0,
         assignment_temperature: float = 0.7,
         absolute_recency_floor: float = 0.1,
+        prototype_momentum: float = 0.95,
+        routing_warmup_steps: int = 100,
+        min_slot_similarity: float = 0.0,
+        min_slot_margin: float = 0.02,
+        dead_slot_patience: int = 100,
     ):
         super().__init__()
         del n_heads_fusion
@@ -56,6 +64,16 @@ class TTF_SemTime_Slots(nn.Module):
             raise ValueError("assignment_temperature must be > 0")
         if not 0.0 <= absolute_recency_floor <= 1.0:
             raise ValueError("absolute_recency_floor must be in [0, 1]")
+        if not 0.0 <= prototype_momentum < 1.0:
+            raise ValueError("prototype_momentum must be in [0, 1)")
+        if routing_warmup_steps < 0:
+            raise ValueError("routing_warmup_steps must be >= 0")
+        if not -1.0 <= min_slot_similarity <= 1.0:
+            raise ValueError("min_slot_similarity must be in [-1, 1]")
+        if not 0.0 <= min_slot_margin <= 2.0:
+            raise ValueError("min_slot_margin must be in [0, 2]")
+        if dead_slot_patience < 1:
+            raise ValueError("dead_slot_patience must be >= 1")
 
         self.use_text_embeddings = use_text_embeddings
         if not use_text_embeddings:
@@ -75,31 +93,47 @@ class TTF_SemTime_Slots(nn.Module):
         self.max_length = int(max_length)
         self.assignment_temperature = float(assignment_temperature)
         self.absolute_recency_floor = float(absolute_recency_floor)
-        self.assignment_gradient_scale = 0.1
+        self.prototype_momentum = float(prototype_momentum)
+        self.routing_warmup_steps = int(routing_warmup_steps)
+        self.min_slot_similarity = float(min_slot_similarity)
+        self.min_slot_margin = float(min_slot_margin)
+        self.dead_slot_patience = int(dead_slot_patience)
 
         self.input_proj = (
             nn.Linear(d_model, self.d_txt)
             if d_model != self.d_txt
             else nn.Identity()
         )
-        # All slots classify notes in one shared semantic space.  The previous
-        # version gave every slot a different slice of a projected key, so its
-        # scores were not comparable as semantic-class scores.
-        self.key_proj = nn.Linear(self.d_txt, self.slot_dim, bias=False)
         self.value_proj = nn.Linear(self.d_txt, self.slot_dim, bias=False)
         self.consistency_proj = nn.Linear(self.d_txt, self.d_txt, bias=False)
 
-        self.slot_queries = nn.Parameter(
-            torch.empty(self.semantic_slots, self.slot_dim)
-        )
-        nn.init.orthogonal_(self.slot_queries)
-        # Remove a global slot preference before classification.  The running
-        # centre is used at evaluation so assignment is not batch-dependent.
+        # The fallback is orthogonal only so a freshly constructed module can
+        # run in eval mode.  The first training batch replaces it with
+        # data-driven prototypes selected from the original LLM embedding
+        # space.  Keeping routing in that stable space prevents the forecast
+        # objective from warping all semantic keys toward one winning slot.
+        initial_prototypes = torch.empty(self.semantic_slots, d_model)
+        nn.init.orthogonal_(initial_prototypes)
         self.register_buffer(
-            "slot_logit_center",
+            "slot_prototypes",
+            F.normalize(initial_prototypes.float(), dim=-1),
+        )
+        self.register_buffer(
+            "slot_prototypes_initialized",
+            torch.tensor(False, dtype=torch.bool),
+        )
+        self.register_buffer(
+            "slot_usage_ema",
             torch.zeros(self.semantic_slots, dtype=torch.float32),
         )
-        self.slot_center_momentum = 0.95
+        self.register_buffer(
+            "slot_idle_steps",
+            torch.zeros(self.semantic_slots, dtype=torch.long),
+        )
+        self.register_buffer(
+            "routing_steps",
+            torch.zeros((), dtype=torch.long),
+        )
         self.log_recency_sigma = nn.Parameter(
             torch.full(
                 (self.semantic_slots,),
@@ -137,39 +171,117 @@ class TTF_SemTime_Slots(nn.Module):
         self.last_absolute_recency_strength = None
         self.last_slot_outputs = None
         self.last_soft_slot_assignment = None
+        self.last_slot_confidence = None
+        self.last_slot_margin = None
+        self.last_rejection_rate = None
+        self.last_slot_usage_ema = None
+        self.last_prototype_similarity = None
 
-    def _normalized_slot_prototypes(self) -> torch.Tensor:
-        """Return stable unit-scale prototypes without Gram-Schmidt poles.
+    @staticmethod
+    def _unit_normalize(value: torch.Tensor) -> torch.Tensor:
+        value = value.float()
+        return value / value.norm(dim=-1, keepdim=True).clamp_min(1e-8)
 
-        The parameters are initialized orthogonally.  Independently bounding
-        each norm keeps cosine scores comparable while avoiding the singular
-        gradient produced when differentiable Gram-Schmidt receives two nearly
-        collinear learned prototypes.
-        """
-        queries = self.slot_queries.float()
-        norms = queries.norm(dim=-1, keepdim=True).clamp_min(0.1)
-        return queries / norms
-
-    def _center_slot_logits(
+    @torch.no_grad()
+    def _initialize_prototypes(
         self,
-        slot_logits: torch.Tensor,
+        routing_keys: torch.Tensor,
         note_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Remove persistent global preference for one slot."""
-        valid_logits = slot_logits.permute(0, 2, 1)[note_mask]
-        if valid_logits.numel() == 0:
-            center = self.slot_logit_center
-        elif self.training:
-            batch_center = valid_logits.mean(dim=0)
-            with torch.no_grad():
-                self.slot_logit_center.mul_(self.slot_center_momentum).add_(
-                    batch_center.detach(),
-                    alpha=1.0 - self.slot_center_momentum,
-                )
-            center = batch_center.detach()
-        else:
-            center = self.slot_logit_center
-        return slot_logits - center.view(1, -1, 1)
+    ) -> None:
+        """Seed distinct global slots from real training-note embeddings."""
+        valid_keys = routing_keys[note_mask]
+        if valid_keys.numel() == 0:
+            return
+
+        valid_keys = self._unit_normalize(valid_keys)
+        n_select = min(self.semantic_slots, valid_keys.shape[0])
+        selected = torch.zeros(
+            valid_keys.shape[0],
+            dtype=torch.bool,
+            device=valid_keys.device,
+        )
+
+        # Start from the note nearest the global semantic centre, then choose
+        # each next note farthest from every already selected prototype.
+        global_centre = self._unit_normalize(
+            valid_keys.mean(dim=0, keepdim=True)
+        ).squeeze(0)
+        first_idx = torch.mv(valid_keys, global_centre).argmax()
+        chosen = [valid_keys[first_idx]]
+        selected[first_idx] = True
+
+        while len(chosen) < n_select:
+            chosen_matrix = torch.stack(chosen, dim=0)
+            nearest_similarity = (
+                valid_keys @ chosen_matrix.transpose(0, 1)
+            ).max(dim=1).values
+            nearest_similarity = nearest_similarity.masked_fill(
+                selected, float("inf")
+            )
+            next_idx = nearest_similarity.argmin()
+            chosen.append(valid_keys[next_idx])
+            selected[next_idx] = True
+
+        initialized = self.slot_prototypes.clone()
+        initialized[:n_select] = torch.stack(chosen, dim=0)
+        self.slot_prototypes.copy_(self._unit_normalize(initialized))
+        self.slot_prototypes_initialized.fill_(True)
+
+    @torch.no_grad()
+    def _update_prototypes(
+        self,
+        routing_keys: torch.Tensor,
+        note_mask: torch.Tensor,
+        winning_slot: torch.Tensor,
+    ) -> None:
+        """EMA-update occupied slots and revive slots unused for many steps."""
+        valid_keys = routing_keys[note_mask]
+        valid_winners = winning_slot[note_mask]
+        if valid_keys.numel() == 0:
+            return
+
+        counts = torch.bincount(
+            valid_winners,
+            minlength=self.semantic_slots,
+        ).to(torch.float32)
+        batch_usage = counts / counts.sum().clamp_min(1.0)
+        self.slot_usage_ema.mul_(self.prototype_momentum).add_(
+            batch_usage,
+            alpha=1.0 - self.prototype_momentum,
+        )
+        self.slot_idle_steps.add_(1)
+
+        for slot_idx in range(self.semantic_slots):
+            assigned = valid_keys[valid_winners == slot_idx]
+            if assigned.numel() == 0:
+                continue
+            batch_centre = self._unit_normalize(
+                assigned.mean(dim=0, keepdim=True)
+            ).squeeze(0)
+            updated = (
+                self.prototype_momentum * self.slot_prototypes[slot_idx]
+                + (1.0 - self.prototype_momentum) * batch_centre
+            )
+            self.slot_prototypes[slot_idx].copy_(
+                self._unit_normalize(updated.unsqueeze(0)).squeeze(0)
+            )
+            self.slot_idle_steps[slot_idx] = 0
+
+        # A rare class may be absent from many individual mini-batches, so a
+        # slot is revived only after a long completely idle period.  The new
+        # centre is the note least represented by all current centres.  This
+        # prevents permanent dead slots without imposing equal class sizes.
+        dead_slots = torch.nonzero(
+            self.slot_idle_steps >= self.dead_slot_patience,
+            as_tuple=False,
+        ).flatten()
+        for slot_idx in dead_slots.tolist():
+            similarities = valid_keys @ self.slot_prototypes.transpose(0, 1)
+            least_represented = similarities.max(dim=1).values.argmin()
+            self.slot_prototypes[slot_idx].copy_(valid_keys[least_represented])
+            self.slot_idle_steps[slot_idx] = 0
+
+        self.routing_steps.add_(1)
 
     @staticmethod
     def _masked_softmax(logits, valid_mask, dim=-1):
@@ -263,8 +375,8 @@ class TTF_SemTime_Slots(nn.Module):
         tau = torch.where(note_mask, tau, torch.zeros_like(tau))
 
         T_f = t_hat.shape[1]
-        M_txt = note_mask.any(dim=1, keepdim=True)
         if K == 0:
+            M_txt = note_mask.any(dim=1, keepdim=True)
             self.last_slot_assignment = None
             self.last_semantic_weights = None
             self.last_slot_mass = None
@@ -272,53 +384,73 @@ class TTF_SemTime_Slots(nn.Module):
             self.last_soft_slot_assignment = None
             return V.new_zeros((B, T_f, self.d_txt)), M_txt
 
-        V = self.input_proj(V)
-        self._require_finite("projected text embeddings", V)
-        V = V * note_mask.unsqueeze(-1).to(V.dtype)
+        # Routing uses the original, stable LLM embedding space.  It is kept
+        # independent from the trainable value projection so the forecasting
+        # objective cannot collapse all semantic keys into one direction.
+        routing_keys = self._unit_normalize(V.detach())
+        self._require_finite("semantic routing keys", routing_keys)
+        if self.training and not bool(self.slot_prototypes_initialized.item()):
+            self._initialize_prototypes(routing_keys, note_mask)
 
-        raw_keys = self.key_proj(V)
-        self._require_finite("semantic key projection", raw_keys)
-        keys = self._bounded_normalize(raw_keys)
-        self._require_finite("normalized semantic keys", keys)
-        shared_values = self.value_proj(V)
-        values = shared_values.unsqueeze(1).expand(
-            B, self.semantic_slots, K, self.slot_dim
-        )
-
-        # (B, H, K): comparable cosine score between semantic prototype h and
-        # note k in the same shared key space.
-        self._require_finite("semantic slot parameters", self.slot_queries)
-        slot_prototypes = self._normalized_slot_prototypes()
-        self._require_finite(
-            "normalized semantic slot prototypes", slot_prototypes
-        )
+        slot_prototypes = self._unit_normalize(self.slot_prototypes)
+        self._require_finite("semantic slot prototypes", slot_prototypes)
         slot_logits = torch.einsum(
-            "hd,bkd->bhk", slot_prototypes, keys
+            "hd,bkd->bhk", slot_prototypes, routing_keys
         )
-        self._require_finite("semantic slot logits", slot_logits)
-        slot_logits = self._center_slot_logits(slot_logits, note_mask)
-        self._require_finite("centered semantic slot logits", slot_logits)
+        self._require_finite("semantic slot similarities", slot_logits)
 
-        # Forward: strict one-hot classification.  Backward: gradients of the
-        # corresponding soft assignment (straight-through estimator).
         soft_assignment = torch.softmax(
-            slot_logits.float() / self.assignment_temperature,
+            slot_logits / self.assignment_temperature,
             dim=1,
         )
         self._require_finite("soft slot assignment", soft_assignment)
-        winning_slot = soft_assignment.argmax(dim=1)
+        winning_slot = slot_logits.argmax(dim=1)
+
+        top_two = slot_logits.topk(k=2, dim=1).values
+        slot_confidence = top_two[:, 0]
+        slot_margin = top_two[:, 0] - top_two[:, 1]
+        threshold_active = (
+            bool(self.slot_prototypes_initialized.item())
+            and int(self.routing_steps.item()) >= self.routing_warmup_steps
+        )
+        if threshold_active:
+            accepted_note_mask = (
+                note_mask
+                & (slot_confidence >= self.min_slot_similarity)
+                & (slot_margin >= self.min_slot_margin)
+            )
+        else:
+            accepted_note_mask = note_mask
+
         hard_assignment = F.one_hot(
             winning_slot,
             num_classes=self.semantic_slots,
         ).permute(0, 2, 1).to(soft_assignment.dtype)
-        hard_assignment = hard_assignment * note_mask[:, None, :].float()
-        slot_assignment = (
-            hard_assignment
-            + self.assignment_gradient_scale
-            * (soft_assignment - soft_assignment.detach())
+        hard_assignment = (
+            hard_assignment * accepted_note_mask[:, None, :].float()
         )
-        slot_assignment = slot_assignment * note_mask[:, None, :].float()
+        # Classification is deliberately strict: a note is either owned by
+        # one slot or rejected.  Semantic-centre learning happens through the
+        # online EMA update rather than an indirect forecasting-loss gradient.
+        slot_assignment = hard_assignment
         slot_note_mask = hard_assignment.to(torch.bool)
+        M_txt = accepted_note_mask.any(dim=1, keepdim=True)
+
+        if self.training:
+            self._update_prototypes(
+                routing_keys,
+                note_mask,
+                winning_slot,
+            )
+
+        V = self.input_proj(V)
+        self._require_finite("projected text embeddings", V)
+        V = V * note_mask.unsqueeze(-1).to(V.dtype)
+
+        shared_values = self.value_proj(V)
+        values = shared_values.unsqueeze(1).expand(
+            B, self.semantic_slots, K, self.slot_dim
+        )
 
         raw_slot_mass = slot_assignment.sum(dim=-1)
         # A hard classifier naturally creates empty slots for patients with
@@ -328,7 +460,7 @@ class TTF_SemTime_Slots(nn.Module):
         # stable denominator for an empty slot.
         hard_slot_count = hard_assignment.sum(dim=-1)
         stable_slot_count = hard_slot_count.clamp_min(1.0)
-        valid_count = note_mask.sum(dim=-1, keepdim=True).float()
+        valid_count = accepted_note_mask.sum(dim=-1, keepdim=True).float()
         slot_mass = raw_slot_mass / valid_count.clamp_min(1.0)
 
         # Within each slot, normalize only over its assigned real notes.
@@ -336,7 +468,7 @@ class TTF_SemTime_Slots(nn.Module):
 
         consistency_vectors = self.consistency_proj(V)
         consistency = self._slot_consistency(
-            semantic_weights, consistency_vectors, note_mask
+            semantic_weights, consistency_vectors, accepted_note_mask
         )
         self._require_finite("slot consistency", consistency)
         disagreement = 1.0 - consistency
@@ -447,5 +579,17 @@ class TTF_SemTime_Slots(nn.Module):
             absolute_recency_strength.detach()
         )
         self.last_slot_outputs = slot_outputs.detach()
+        self.last_slot_confidence = slot_confidence.detach()
+        self.last_slot_margin = slot_margin.detach()
+        real_note_count = note_mask.sum().clamp_min(1)
+        self.last_rejection_rate = (
+            (note_mask & ~accepted_note_mask).sum().float()
+            / real_note_count.float()
+        ).detach()
+        self.last_slot_usage_ema = self.slot_usage_ema.detach().clone()
+        prototype_similarity = (
+            slot_prototypes @ slot_prototypes.transpose(0, 1)
+        )
+        self.last_prototype_similarity = prototype_similarity.detach()
 
         return E_txt, M_txt
