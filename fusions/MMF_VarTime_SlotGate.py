@@ -1,4 +1,4 @@
-# BUILD_ID: objective-neutral-slot-gate-v8-20260829
+# BUILD_ID: zero-safe-slot-gate-v9-20260829
 import math
 
 import torch
@@ -214,9 +214,14 @@ class MMF_VarTime_SlotGate(nn.Module):
         text_mask = has_text.view(B, 1, 1).to(Y_ts.dtype)
 
         E_slots = E_txt.reshape(B, T, self.semantic_slots, self.slot_dim)
-        slot_rms = (
-            E_slots.float().square().mean(dim=-1, keepdim=True).sqrt()
-        ).to(E_slots.dtype)
+        # Strict TTF routing can produce exactly empty (all-zero) slots.  The
+        # derivative of sqrt(x) is singular at x=0, so the previous RMS
+        # restoration created a finite forward value but a NaN backward
+        # gradient.  Clamping the power before sqrt keeps empty slots exactly
+        # zero after LayerNorm multiplication while making their gradient
+        # finite.
+        slot_power = E_slots.float().square().mean(dim=-1, keepdim=True)
+        slot_rms = slot_power.clamp_min(1e-8).sqrt().to(E_slots.dtype)
         E_slots = self.slot_norm(E_slots) * slot_rms
 
         # Detach only the residual-query input.  The explicit addition at the
