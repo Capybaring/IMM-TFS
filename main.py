@@ -19,7 +19,7 @@ from lib.evaluation import compute_all_losses, evaluation
 
 # from lib.parse_datasets_old import parse_datasets, get_input_and_pred_len
 
-from lib.parse_datasets_mimic_expanded import parse_datasets, get_input_and_pred_len
+from lib.parse_datasets import parse_datasets, get_input_and_pred_len
 
 # NOTE: main.py used to import every baseline model unconditionally at
 # startup. That means a broken/incompatible optional dependency for ANY one
