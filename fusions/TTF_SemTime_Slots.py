@@ -1,4 +1,4 @@
-# BUILD_ID: strict-semantic-slots-v9-20260829
+# BUILD_ID: stable-strict-semantic-slots-v10-20260829
 import math
 
 import torch
@@ -137,15 +137,17 @@ class TTF_SemTime_Slots(nn.Module):
         self.last_slot_outputs = None
         self.last_soft_slot_assignment = None
 
-    def _orthogonal_slot_prototypes(self) -> torch.Tensor:
-        """Return differentiable, unit, mutually orthogonal slot prototypes."""
-        basis = []
-        for slot_idx in range(self.semantic_slots):
-            vector = self.slot_queries[slot_idx].float()
-            for previous in basis:
-                vector = vector - torch.dot(vector, previous) * previous
-            basis.append(F.normalize(vector, dim=0, eps=1e-6))
-        return torch.stack(basis, dim=0)
+    def _normalized_slot_prototypes(self) -> torch.Tensor:
+        """Return stable unit-scale prototypes without Gram-Schmidt poles.
+
+        The parameters are initialized orthogonally.  Independently bounding
+        each norm keeps cosine scores comparable while avoiding the singular
+        gradient produced when differentiable Gram-Schmidt receives two nearly
+        collinear learned prototypes.
+        """
+        queries = self.slot_queries.float()
+        norms = queries.norm(dim=-1, keepdim=True).clamp_min(0.1)
+        return queries / norms
 
     def _center_slot_logits(
         self,
@@ -269,10 +271,14 @@ class TTF_SemTime_Slots(nn.Module):
 
         # (B, H, K): comparable cosine score between semantic prototype h and
         # note k in the same shared key space.
-        slot_prototypes = self._orthogonal_slot_prototypes()
+        slot_prototypes = self._normalized_slot_prototypes()
         slot_logits = torch.einsum(
             "hd,bkd->bhk", slot_prototypes, keys
         )
+        if not torch.isfinite(slot_logits).all():
+            raise FloatingPointError(
+                "Semantic-slot logits became NaN or Inf before assignment"
+            )
         slot_logits = self._center_slot_logits(slot_logits, note_mask)
 
         # Forward: strict one-hot classification.  Backward: gradients of the
@@ -296,13 +302,18 @@ class TTF_SemTime_Slots(nn.Module):
         slot_note_mask = hard_assignment.to(torch.bool)
 
         raw_slot_mass = slot_assignment.sum(dim=-1)
+        # A hard classifier naturally creates empty slots for patients with
+        # fewer note categories than H.  Dividing a straight-through tensor by
+        # 1e-8 amplified its backward gradient by 1e8 and caused the observed
+        # NaNs.  Forward hard counts are exact integers, so one is the correct
+        # stable denominator for an empty slot.
+        hard_slot_count = hard_assignment.sum(dim=-1)
+        stable_slot_count = hard_slot_count.clamp_min(1.0)
         valid_count = note_mask.sum(dim=-1, keepdim=True).float()
         slot_mass = raw_slot_mass / valid_count.clamp_min(1.0)
 
         # Within each slot, normalize only over its assigned real notes.
-        semantic_weights = slot_assignment / raw_slot_mass.unsqueeze(-1).clamp_min(
-            1e-8
-        )
+        semantic_weights = slot_assignment / stable_slot_count.unsqueeze(-1)
 
         consistency_vectors = self.consistency_proj(V)
         consistency = self._slot_consistency(
@@ -379,7 +390,7 @@ class TTF_SemTime_Slots(nn.Module):
         recency_numer = (
             slot_assignment[:, :, None, :] * temporal_kernel
         ).sum(dim=-1)
-        recency_denom = raw_slot_mass[:, :, None].clamp_min(1e-8)
+        recency_denom = stable_slot_count[:, :, None]
         absolute_recency_strength = recency_numer / recency_denom
         absolute_recency_strength = (
             self.absolute_recency_floor
