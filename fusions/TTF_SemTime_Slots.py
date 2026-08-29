@@ -1,4 +1,4 @@
-# BUILD_ID: stable-strict-semantic-slots-v10-20260829
+# BUILD_ID: bounded-strict-semantic-slots-v11-20260829
 import math
 
 import torch
@@ -75,6 +75,7 @@ class TTF_SemTime_Slots(nn.Module):
         self.max_length = int(max_length)
         self.assignment_temperature = float(assignment_temperature)
         self.absolute_recency_floor = float(absolute_recency_floor)
+        self.assignment_gradient_scale = 0.1
 
         self.input_proj = (
             nn.Linear(d_model, self.d_txt)
@@ -178,12 +179,23 @@ class TTF_SemTime_Slots(nn.Module):
         weights = weights * valid_mask.to(weights.dtype)
         return weights / weights.sum(dim=dim, keepdim=True).clamp_min(1e-8)
 
+    @staticmethod
+    def _bounded_normalize(value: torch.Tensor) -> torch.Tensor:
+        """Normalize directions while bounding the inverse-norm gradient."""
+        value = value.float()
+        return value / value.norm(dim=-1, keepdim=True).clamp_min(0.1)
+
+    @staticmethod
+    def _require_finite(name: str, value: torch.Tensor) -> None:
+        if not torch.isfinite(value).all():
+            raise FloatingPointError(
+                f"TTF_SemTime_Slots produced NaN or Inf in {name}"
+            )
+
     def _slot_consistency(self, semantic_weights, semantic_vectors, note_mask):
         # Routing statistics stay in float32 even when the surrounding model
         # uses AMP; tiny slot masses must not underflow before division.
-        normalized = F.normalize(
-            semantic_vectors.float(), p=2, dim=-1, eps=1e-8
-        )
+        normalized = self._bounded_normalize(semantic_vectors)
         pairwise = torch.einsum("bkd,bjd->bkj", normalized, normalized)
 
         valid_pairs = (
@@ -261,9 +273,13 @@ class TTF_SemTime_Slots(nn.Module):
             return V.new_zeros((B, T_f, self.d_txt)), M_txt
 
         V = self.input_proj(V)
+        self._require_finite("projected text embeddings", V)
         V = V * note_mask.unsqueeze(-1).to(V.dtype)
 
-        keys = F.normalize(self.key_proj(V).float(), dim=-1, eps=1e-6)
+        raw_keys = self.key_proj(V)
+        self._require_finite("semantic key projection", raw_keys)
+        keys = self._bounded_normalize(raw_keys)
+        self._require_finite("normalized semantic keys", keys)
         shared_values = self.value_proj(V)
         values = shared_values.unsqueeze(1).expand(
             B, self.semantic_slots, K, self.slot_dim
@@ -271,15 +287,17 @@ class TTF_SemTime_Slots(nn.Module):
 
         # (B, H, K): comparable cosine score between semantic prototype h and
         # note k in the same shared key space.
+        self._require_finite("semantic slot parameters", self.slot_queries)
         slot_prototypes = self._normalized_slot_prototypes()
+        self._require_finite(
+            "normalized semantic slot prototypes", slot_prototypes
+        )
         slot_logits = torch.einsum(
             "hd,bkd->bhk", slot_prototypes, keys
         )
-        if not torch.isfinite(slot_logits).all():
-            raise FloatingPointError(
-                "Semantic-slot logits became NaN or Inf before assignment"
-            )
+        self._require_finite("semantic slot logits", slot_logits)
         slot_logits = self._center_slot_logits(slot_logits, note_mask)
+        self._require_finite("centered semantic slot logits", slot_logits)
 
         # Forward: strict one-hot classification.  Backward: gradients of the
         # corresponding soft assignment (straight-through estimator).
@@ -287,6 +305,7 @@ class TTF_SemTime_Slots(nn.Module):
             slot_logits.float() / self.assignment_temperature,
             dim=1,
         )
+        self._require_finite("soft slot assignment", soft_assignment)
         winning_slot = soft_assignment.argmax(dim=1)
         hard_assignment = F.one_hot(
             winning_slot,
@@ -295,8 +314,8 @@ class TTF_SemTime_Slots(nn.Module):
         hard_assignment = hard_assignment * note_mask[:, None, :].float()
         slot_assignment = (
             hard_assignment
-            + soft_assignment
-            - soft_assignment.detach()
+            + self.assignment_gradient_scale
+            * (soft_assignment - soft_assignment.detach())
         )
         slot_assignment = slot_assignment * note_mask[:, None, :].float()
         slot_note_mask = hard_assignment.to(torch.bool)
@@ -319,6 +338,7 @@ class TTF_SemTime_Slots(nn.Module):
         consistency = self._slot_consistency(
             semantic_weights, consistency_vectors, note_mask
         )
+        self._require_finite("slot consistency", consistency)
         disagreement = 1.0 - consistency
 
         entropy = -(
@@ -336,6 +356,7 @@ class TTF_SemTime_Slots(nn.Module):
         )
         learned_gate = torch.sigmoid(self.time_gate(gate_features).squeeze(-1))
         time_gate = disagreement * learned_gate * slot_mass
+        self._require_finite("semantic time gate", time_gate)
 
         delta = (
             t_hat[:, :, None].float() - tau[:, None, :].float()
@@ -350,6 +371,7 @@ class TTF_SemTime_Slots(nn.Module):
             delta[:, None, :, :] / sigma[None, :, None, None]
         ).square()
         time_logits = time_logits.clamp(min=-80.0, max=0.0)
+        self._require_finite("temporal logits", time_logits)
         temporal_kernel = time_logits.exp()
 
         # Only notes classified into a slot can participate in that slot's
@@ -364,6 +386,7 @@ class TTF_SemTime_Slots(nn.Module):
             B, self.semantic_slots, T_f, K
         )
         fused_weights = self._masked_softmax(fused_logits, fused_mask, dim=-1)
+        self._require_finite("slot-local temporal weights", fused_weights)
 
         slot_outputs = torch.einsum(
             "bhtk,bhkd->bhtd", fused_weights.to(values.dtype), values
@@ -381,6 +404,7 @@ class TTF_SemTime_Slots(nn.Module):
             ],
             dim=1,
         )
+        self._require_finite("slot output heads", slot_outputs)
 
         # Absolute evidence strength does not normalize away with K=1.  It is
         # the assignment-weighted Gaussian age of the reports owned by each
@@ -410,6 +434,7 @@ class TTF_SemTime_Slots(nn.Module):
 
         E_txt = slot_outputs.permute(0, 2, 1, 3).reshape(B, T_f, self.d_txt)
         E_txt = E_txt * M_txt[:, :, None].to(E_txt.dtype)
+        self._require_finite("final text representation", E_txt)
 
         self.last_slot_assignment = slot_assignment.detach()
         self.last_soft_slot_assignment = soft_assignment.detach()
