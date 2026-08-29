@@ -232,14 +232,16 @@ class TTF_SemTime_Slots(nn.Module):
         self,
         routing_keys: torch.Tensor,
         note_mask: torch.Tensor,
+        accepted_note_mask: torch.Tensor,
         winning_slot: torch.Tensor,
     ) -> None:
         """EMA-update occupied slots and revive slots unused for many steps."""
-        valid_keys = routing_keys[note_mask]
-        valid_winners = winning_slot[note_mask]
-        if valid_keys.numel() == 0:
+        candidate_keys = routing_keys[note_mask]
+        if candidate_keys.numel() == 0:
             return
 
+        valid_keys = routing_keys[accepted_note_mask]
+        valid_winners = winning_slot[accepted_note_mask]
         counts = torch.bincount(
             valid_winners,
             minlength=self.semantic_slots,
@@ -251,21 +253,22 @@ class TTF_SemTime_Slots(nn.Module):
         )
         self.slot_idle_steps.add_(1)
 
-        for slot_idx in range(self.semantic_slots):
-            assigned = valid_keys[valid_winners == slot_idx]
-            if assigned.numel() == 0:
-                continue
-            batch_centre = self._unit_normalize(
-                assigned.mean(dim=0, keepdim=True)
-            ).squeeze(0)
-            updated = (
-                self.prototype_momentum * self.slot_prototypes[slot_idx]
-                + (1.0 - self.prototype_momentum) * batch_centre
-            )
-            self.slot_prototypes[slot_idx].copy_(
-                self._unit_normalize(updated.unsqueeze(0)).squeeze(0)
-            )
-            self.slot_idle_steps[slot_idx] = 0
+        if valid_keys.numel() > 0:
+            for slot_idx in range(self.semantic_slots):
+                assigned = valid_keys[valid_winners == slot_idx]
+                if assigned.numel() == 0:
+                    continue
+                batch_centre = self._unit_normalize(
+                    assigned.mean(dim=0, keepdim=True)
+                ).squeeze(0)
+                updated = (
+                    self.prototype_momentum * self.slot_prototypes[slot_idx]
+                    + (1.0 - self.prototype_momentum) * batch_centre
+                )
+                self.slot_prototypes[slot_idx].copy_(
+                    self._unit_normalize(updated.unsqueeze(0)).squeeze(0)
+                )
+                self.slot_idle_steps[slot_idx] = 0
 
         # A rare class may be absent from many individual mini-batches, so a
         # slot is revived only after a long completely idle period.  The new
@@ -276,9 +279,13 @@ class TTF_SemTime_Slots(nn.Module):
             as_tuple=False,
         ).flatten()
         for slot_idx in dead_slots.tolist():
-            similarities = valid_keys @ self.slot_prototypes.transpose(0, 1)
+            similarities = (
+                candidate_keys @ self.slot_prototypes.transpose(0, 1)
+            )
             least_represented = similarities.max(dim=1).values.argmin()
-            self.slot_prototypes[slot_idx].copy_(valid_keys[least_represented])
+            self.slot_prototypes[slot_idx].copy_(
+                candidate_keys[least_represented]
+            )
             self.slot_idle_steps[slot_idx] = 0
 
         self.routing_steps.add_(1)
@@ -440,6 +447,7 @@ class TTF_SemTime_Slots(nn.Module):
             self._update_prototypes(
                 routing_keys,
                 note_mask,
+                accepted_note_mask,
                 winning_slot,
             )
 
