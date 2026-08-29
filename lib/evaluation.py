@@ -1,4 +1,4 @@
-# BUILD_ID: supervised-fusion-diagnostics-v2-20260829
+# BUILD_ID: staged-fusion-diagnostics-v3-20260829
 import math
 
 import torch
@@ -76,6 +76,7 @@ def compute_all_losses(
     fusion_base_loss_weight=0.0,
     fusion_gate_loss_weight=0.0,
     semantic_routing_loss_weight=0.0,
+    fusion_candidate_loss_weight=0.0,
 ):
     base_pred = model.forecasting(
         batch_dict["tp_to_predict"],
@@ -127,6 +128,11 @@ def compute_all_losses(
             "routing_loss",
             None,
         )
+        candidate_prediction_fn = getattr(
+            getattr(fusion, "mmf", None),
+            "candidate_prediction_for_loss",
+            None,
+        )
         gate_loss = (
             gate_loss_fn(target, mask)
             if gate_loss_fn is not None
@@ -137,18 +143,36 @@ def compute_all_losses(
             if routing_loss_fn is not None
             else mse.new_zeros(())
         )
+        candidate_prediction = (
+            candidate_prediction_fn()
+            if candidate_prediction_fn is not None
+            else None
+        )
+        candidate_mse = (
+            compute_error(
+                target,
+                candidate_prediction,
+                mask,
+                "MSE",
+                "mean",
+            )
+            if candidate_prediction is not None
+            else mse.new_zeros(())
+        )
         base_weight = float(fusion_base_loss_weight)
         loss = (
             (1.0 - base_weight) * mse
             + base_weight * base_mse
             + float(fusion_gate_loss_weight) * gate_loss
             + float(semantic_routing_loss_weight) * routing_loss
+            + float(fusion_candidate_loss_weight) * candidate_mse
         )
         results.update(
             {
                 "base_mse": base_mse.item(),
                 "gate_loss": gate_loss.item(),
                 "routing_loss": routing_loss.item(),
+                "candidate_mse": candidate_mse.item(),
             }
         )
 
@@ -212,6 +236,8 @@ def _collect_fusion_diagnostics(
             None,
         )
         text_mask = getattr(mmf, "last_text_mask", None)
+        context = getattr(mmf, "last_context", None)
+        delta = getattr(mmf, "last_delta", None)
         attention = getattr(mmf, "last_slot_attention", None)
 
         # The current no-NULL SlotGate keeps an all-zero compatibility tensor,
@@ -237,6 +263,41 @@ def _collect_fusion_diagnostics(
             "text_variable_relevance_mean",
             variable_relevance,
         )
+        if context is not None:
+            _add_diag(
+                diag_sum,
+                diag_count,
+                "mmf_context_rms",
+                context.square().mean(dim=-1).sqrt(),
+            )
+        if delta is not None:
+            _add_diag(
+                diag_sum,
+                diag_count,
+                "mmf_delta_abs_mean",
+                delta.abs(),
+            )
+        delta_out = getattr(mmf, "delta_out", None)
+        if delta_out is not None:
+            _add_diag(
+                diag_sum,
+                diag_count,
+                "mmf_delta_out_weight_norm",
+                delta_out.weight.detach().norm().reshape(1),
+            )
+        if candidate_correction is not None:
+            _add_diag(
+                diag_sum,
+                diag_count,
+                "text_candidate_correction_abs_mean",
+                candidate_correction.abs(),
+            )
+            _add_diag(
+                diag_sum,
+                diag_count,
+                "text_candidate_correction_abs_max",
+                candidate_correction.abs().max().reshape(1),
+            )
         if correction is not None:
             _add_diag(
                 diag_sum,
@@ -269,8 +330,18 @@ def _collect_fusion_diagnostics(
             candidate_error = (
                 target - (base_prediction + candidate_correction)
             ).square()
-            gate_target = (candidate_error < base_error).to(gate.dtype)
-            valid = mask.to(torch.bool) & text_mask.to(torch.bool)
+            improvement = base_error - candidate_error
+            tie_tolerance = 1e-6 * (1.0 + base_error)
+            gate_target = (improvement > 0).to(gate.dtype)
+            observed_text = mask.to(torch.bool) & text_mask.to(torch.bool)
+            labeled = improvement.abs() > tie_tolerance
+            valid = observed_text & labeled
+            _add_diag(
+                diag_sum,
+                diag_count,
+                "text_gate_labeled_fraction",
+                labeled.to(torch.float32)[observed_text],
+            )
             if valid.any():
                 _add_diag(
                     diag_sum,
@@ -357,6 +428,19 @@ def _collect_fusion_diagnostics(
                 diag_count,
                 "ttf_effective_slot_count",
                 effective_slots[valid],
+            )
+        if slot_outputs is not None:
+            output_rms = slot_outputs.square().mean(dim=-1).sqrt()
+            if slot_mass is not None:
+                valid_output = (slot_mass > 0).unsqueeze(-1).expand_as(
+                    output_rms
+                )
+                output_rms = output_rms[valid_output]
+            _add_diag(
+                diag_sum,
+                diag_count,
+                "ttf_output_rms",
+                output_rms,
             )
         if assignment is not None and assignment.shape[1] > 1:
             valid_notes = assignment.sum(dim=1) > 0

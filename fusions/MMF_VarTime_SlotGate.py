@@ -1,4 +1,4 @@
-# BUILD_ID: supervised-semantic-slot-gate-v6-20260829
+# BUILD_ID: staged-semantic-slot-gate-v7-20260829
 import math
 
 import torch
@@ -145,6 +145,7 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.last_correction = None
         self.last_candidate_correction = None
         self.last_text_mask = None
+        self.last_context = None
         self.last_gate_warmup_active = False
         self._gate_for_aux = None
         self._candidate_correction_for_aux = None
@@ -263,10 +264,9 @@ class MMF_VarTime_SlotGate(nn.Module):
         gate_logits = self.gate_net(interaction).squeeze(-1)
         learned_relevance = torch.sigmoid(gate_logits)
 
-        # Do not let the rejection gate kill an untrained residual.  The
-        # forward gate stays constant during warmup so delta/attention/TTF get
-        # useful gradients; gate_supervision_loss still trains the learned gate
-        # against its counterfactual relevance target from the first epoch.
+        # Do not let the rejection gate kill an untrained residual.  During
+        # warmup, the forward gate stays constant and gate supervision is
+        # disabled.  The ungated candidate receives its own loss instead.
         warmup_active = (
             self.training
             and self.training_epoch < self.gate_warmup_epochs
@@ -325,6 +325,7 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.last_correction = correction.detach()
         self.last_candidate_correction = candidate_correction.detach()
         self.last_text_mask = text_mask.detach()
+        self.last_context = context.detach()
         self.last_gate_warmup_active = bool(warmup_active)
 
         return Y_out
@@ -334,7 +335,7 @@ class MMF_VarTime_SlotGate(nn.Module):
         target: torch.Tensor,
         observed_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Train the gate to predict whether its text candidate is useful."""
+        """Train the gate only after the text candidate has learned."""
         gate = self._gate_for_aux
         candidate = self._candidate_correction_for_aux
         base_prediction = self._base_prediction_for_aux
@@ -344,15 +345,37 @@ class MMF_VarTime_SlotGate(nn.Module):
             for value in (gate, candidate, base_prediction, text_mask)
         ):
             return self.delta_out.weight.sum() * 0.0
+        if self.training_epoch < self.gate_warmup_epochs:
+            return gate.sum() * 0.0
 
         with torch.no_grad():
             base_error = (target - base_prediction).square()
             candidate_error = (
                 target - (base_prediction + candidate)
             ).square()
-            relevance_target = (candidate_error < base_error).to(gate.dtype)
-            valid = observed_mask.to(torch.bool) & text_mask.to(torch.bool)
+            improvement = base_error - candidate_error
+            tie_tolerance = 1e-6 * (1.0 + base_error)
+            relevance_target = (improvement > 0).to(gate.dtype)
+            valid = (
+                observed_mask.to(torch.bool)
+                & text_mask.to(torch.bool)
+                & (improvement.abs() > tie_tolerance)
+            )
 
         if not valid.any():
             return gate.sum() * 0.0
         return F.binary_cross_entropy(gate[valid], relevance_target[valid])
+
+    def candidate_prediction_for_loss(self) -> torch.Tensor | None:
+        """Return the ungated text prediction during candidate warmup."""
+        if (
+            not self.training
+            or self.training_epoch >= self.gate_warmup_epochs
+            or self._candidate_correction_for_aux is None
+            or self._base_prediction_for_aux is None
+        ):
+            return None
+        return (
+            self._base_prediction_for_aux.detach()
+            + self._candidate_correction_for_aux
+        )

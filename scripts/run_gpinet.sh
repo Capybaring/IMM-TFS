@@ -33,7 +33,8 @@ FUSION_LR_MULTIPLIER=1.0
 FUSION_BASE_LOSS_WEIGHT=0.25
 FUSION_GATE_LOSS_WEIGHT=0.1
 SEMANTIC_ROUTING_LOSS_WEIGHT=0.01
-FUSION_WEIGHT_DECAY=0.0001
+FUSION_CANDIDATE_LOSS_WEIGHT=0.25
+FUSION_WEIGHT_DECAY=0.0
 KAPPA=0.1
 
 usage() {
@@ -165,6 +166,7 @@ if [[ "$MODE" == "multi" ]]; then
         --fusion_base_loss_weight "$FUSION_BASE_LOSS_WEIGHT"
         --fusion_gate_loss_weight "$FUSION_GATE_LOSS_WEIGHT"
         --semantic_routing_loss_weight "$SEMANTIC_ROUTING_LOSS_WEIGHT"
+        --fusion_candidate_loss_weight "$FUSION_CANDIDATE_LOSS_WEIGHT"
         --fusion_weight_decay "$FUSION_WEIGHT_DECAY"
         --kappa "$KAPPA"
     )

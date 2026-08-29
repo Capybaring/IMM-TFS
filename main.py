@@ -779,9 +779,15 @@ def get_args_from_parser() -> argparse.Namespace:
         help="Weight of semantic-slot sharpness and balance regularization",
     )
     parser.add_argument(
+        "--fusion_candidate_loss_weight",
+        type=float,
+        default=0.25,
+        help="Weight of ungated text-candidate MSE during gate warmup",
+    )
+    parser.add_argument(
         "--fusion_weight_decay",
         type=float,
-        default=1e-4,
+        default=0.0,
         help="Weight decay applied only to the fusion branch",
     )
     parser.add_argument(
@@ -872,6 +878,8 @@ def get_args_from_parser() -> argparse.Namespace:
         parser.error("--fusion_gate_loss_weight must be >= 0")
     if args.semantic_routing_loss_weight < 0:
         parser.error("--semantic_routing_loss_weight must be >= 0")
+    if args.fusion_candidate_loss_weight < 0:
+        parser.error("--fusion_candidate_loss_weight must be >= 0")
     if args.fusion_weight_decay < 0:
         parser.error("--fusion_weight_decay must be >= 0")
     if (
@@ -1185,9 +1193,8 @@ def trainable(
     logger.info(input_command)
     logger.info(args)
 
-    # Keep both paths regularized.  The direct backbone loss below protects the
-    # numerical forecast, while weight decay and a non-amplified fusion LR keep
-    # the small gate from racing toward saturation.
+    # Preserve GPINet's original regularization, but keep the small fusion
+    # output heads free of L2 shrinkage while their task gradients are weak.
     model_parameters = list(model.parameters())
     fusion_parameters = list(fusion.parameters()) if fusion is not None else []
     trainable_parameters = model_parameters + fusion_parameters
@@ -1196,11 +1203,11 @@ def trainable(
             [
                 {
                     "params": model_parameters,
-                    "weight_decay": args.fusion_weight_decay,
+                    "weight_decay": args.w_decay,
                 },
                 {
                     "params": fusion_parameters,
-                    "weight_decay": args.w_decay,
+                    "weight_decay": args.fusion_weight_decay,
                     "lr": args.lr * args.fusion_lr_multiplier,
                 },
             ],
@@ -1319,6 +1326,7 @@ def trainable(
                                 args.fusion_base_loss_weight,
                                 args.fusion_gate_loss_weight,
                                 args.semantic_routing_loss_weight,
+                                args.fusion_candidate_loss_weight,
                             )
                             loss = train_res["loss"]
                         scaler.scale(loss).backward()
@@ -1338,6 +1346,7 @@ def trainable(
                             args.fusion_base_loss_weight,
                             args.fusion_gate_loss_weight,
                             args.semantic_routing_loss_weight,
+                            args.fusion_candidate_loss_weight,
                         )
                         loss = train_res["loss"]
                         loss.backward()

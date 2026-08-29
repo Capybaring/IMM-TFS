@@ -86,7 +86,7 @@ class TTF_SemTime_Slots(nn.Module):
         self.consistency_proj = nn.Linear(self.d_txt, self.d_txt, bias=False)
 
         self.slot_queries = nn.Parameter(
-            torch.randn(self.semantic_slots, self.slot_dim) * 0.02
+            torch.randn(self.semantic_slots, self.slot_dim) * 0.1
         )
         self.log_recency_sigma = nn.Parameter(
             torch.full(
@@ -103,8 +103,17 @@ class TTF_SemTime_Slots(nn.Module):
         )
         nn.init.constant_(self.time_gate[-1].bias, float(time_gate_bias))
 
-        self.slot_output_norm = nn.LayerNorm(self.slot_dim)
-        self.slot_output_proj = nn.Linear(self.slot_dim, self.slot_dim)
+        # Slot-specific output heads break the permutation-symmetric state in
+        # which every slot learns the same transformation.
+        self.slot_output_norms = nn.ModuleList(
+            [nn.LayerNorm(self.slot_dim) for _ in range(self.semantic_slots)]
+        )
+        self.slot_output_projs = nn.ModuleList(
+            [
+                nn.Linear(self.slot_dim, self.slot_dim)
+                for _ in range(self.semantic_slots)
+            ]
+        )
         self.dropout = nn.Dropout(dropout)
 
         self.last_slot_assignment = None
@@ -240,11 +249,20 @@ class TTF_SemTime_Slots(nn.Module):
             "hd,bkhd->bhk", self.slot_queries, keys
         ) / math.sqrt(self.slot_dim)
 
-        # Crucial change: normalize across H for each note.  Notes now choose
-        # slots instead of every slot independently choosing the same notes.
-        slot_assignment = torch.softmax(
-            slot_logits / self.assignment_temperature, dim=1
-        )
+        # During training, Gumbel noise breaks the exactly-uniform stationary
+        # point of entropy regularization.  Evaluation remains deterministic.
+        if self.training:
+            slot_assignment = F.gumbel_softmax(
+                slot_logits,
+                tau=self.assignment_temperature,
+                hard=False,
+                dim=1,
+            )
+        else:
+            slot_assignment = torch.softmax(
+                slot_logits / self.assignment_temperature,
+                dim=1,
+            )
         slot_assignment = slot_assignment * note_mask[:, None, :].to(V.dtype)
         if self.training:
             self._routing_assignment = slot_assignment
@@ -306,8 +324,18 @@ class TTF_SemTime_Slots(nn.Module):
         slot_outputs = torch.einsum(
             "bhtk,bhkd->bhtd", fused_weights, values
         )
-        slot_outputs = self.slot_output_proj(
-            self.dropout(self.slot_output_norm(slot_outputs))
+        slot_outputs = torch.stack(
+            [
+                self.slot_output_projs[slot_idx](
+                    self.dropout(
+                        self.slot_output_norms[slot_idx](
+                            slot_outputs[:, slot_idx]
+                        )
+                    )
+                )
+                for slot_idx in range(self.semantic_slots)
+            ],
+            dim=1,
         )
 
         # Absolute evidence strength does not normalize away with K=1.  It is
