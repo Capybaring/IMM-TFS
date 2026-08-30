@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Command-line interface: only mode, total-subject count, and model seed.
 MODE="uni"
-TOTAL_N=1000
+TOTAL_N=4000
 MODEL_SEED=1
 
 # Edit the remaining experiment settings directly here.
