@@ -74,16 +74,32 @@ def compute_all_losses(
     enable_text=True,
     use_text_embeddings=True,
 ):
+    native_text = bool(
+        enable_text and getattr(model, "native_text_enabled", False)
+    )
+    forecast_kwargs = {}
+    if native_text:
+        if not use_text_embeddings:
+            raise ValueError(
+                "GPINet native text fusion requires --use_text_embeddings"
+            )
+        forecast_kwargs = {
+            "notes_input": batch_dict["notes_embeddings"],
+            # Native GPINet performs its own normalization against the full
+            # history + prediction window, so it must receive raw timestamps.
+            "tau": batch_dict["tau_raw"],
+        }
     pred_y = model.forecasting(
         batch_dict["tp_to_predict"],
         batch_dict["observed_data"],
         batch_dict["observed_tp"],
         batch_dict["observed_mask"],
+        **forecast_kwargs,
     )
     if not torch.isfinite(pred_y).all():
-        raise ValueError("Numerical prediction contains NaN or Inf")
+        raise ValueError("Model prediction contains NaN or Inf")
 
-    if enable_text and fusion is not None:
+    if enable_text and not native_text and fusion is not None:
         notes_input = (
             batch_dict["notes_embeddings"]
             if use_text_embeddings
@@ -439,12 +455,12 @@ def evaluation(
     enable_text=True,
     use_text_embeddings=True,
 ):
-    """Evaluate fused and same-checkpoint base paths in one pass.
+    """Evaluate text-aware and same-checkpoint base paths in one pass.
 
-    For a multimodal model, ``base_path_*`` is computed from the numerical
-    prediction immediately before fusion in the *same trained checkpoint*.
-    Thus ``fusion_delta_*`` isolates the direct effect of text correction and
-    is not confounded by a separately initialized/retrained kappa=0 run.
+    For native GPINet text fusion, the base pass omits text before the MTGNN
+    backbone and the fused pass includes it. Both use the same trained
+    checkpoint, so ``fusion_delta_*`` measures the direct forward-pass effect
+    of text rather than a separately initialized/retrained numerical model.
     """
     fused_se_sum = fused_ae_sum = fused_ape_sum = None
     base_se_sum = base_ae_sum = None
@@ -454,10 +470,14 @@ def evaluation(
     has_relevance_diag = False
     has_gate_diag = False
     has_null_probability_diag = False
+    native_gate_count = None
     diag_sum = {}
     diag_count = {}
 
     for batch_dict in tqdm(dataloader):
+        native_text = bool(
+            enable_text and getattr(model, "native_text_enabled", False)
+        )
         base_pred = model.forecasting(
             batch_dict["tp_to_predict"],
             batch_dict["observed_data"],
@@ -466,7 +486,20 @@ def evaluation(
         )
         pred_y = base_pred
 
-        if enable_text and fusion is not None:
+        if native_text:
+            if not use_text_embeddings:
+                raise ValueError(
+                    "GPINet native text fusion requires --use_text_embeddings"
+                )
+            pred_y = model.forecasting(
+                batch_dict["tp_to_predict"],
+                batch_dict["observed_data"],
+                batch_dict["observed_tp"],
+                batch_dict["observed_mask"],
+                notes_input=batch_dict["notes_embeddings"],
+                tau=batch_dict["tau_raw"],
+            )
+        elif enable_text and fusion is not None:
             notes_input = (
                 batch_dict["notes_embeddings"]
                 if use_text_embeddings
@@ -497,7 +530,8 @@ def evaluation(
         mask_count += count
         mask_count_mape += count_mape
 
-        if enable_text and fusion is not None:
+        has_text_path = native_text or (enable_text and fusion is not None)
+        if has_text_path:
             base_se, _ = compute_error(target, base_pred, mask, "MSE", "sum")
             base_ae, _ = compute_error(target, base_pred, mask, "MAE", "sum")
             if base_se_sum is None:
@@ -508,6 +542,7 @@ def evaluation(
                 relevance_sum = torch.zeros_like(base_se)
                 gate_sum = torch.zeros_like(base_se)
                 null_probability_sum = torch.zeros_like(base_se)
+                native_gate_count = torch.zeros_like(base_se)
             base_se_sum += base_se
             base_ae_sum += base_ae
 
@@ -515,8 +550,83 @@ def evaluation(
             correction_abs_sum += (correction.abs() * mask).sum(dim=(0, 1))
             correction_signed_sum += (correction * mask).sum(dim=(0, 1))
 
-            mmf = getattr(fusion, "mmf", None)
-            if mmf is not None:
+            mmf = getattr(fusion, "mmf", None) if fusion is not None else None
+            if native_text:
+                text_module = getattr(model, "text_grid_fusion", None)
+                gate_value = getattr(text_module, "last_gate", None)
+                grid_has_text = getattr(
+                    text_module,
+                    "last_grid_has_text",
+                    None,
+                )
+                grid_note_count = getattr(
+                    text_module,
+                    "last_grid_note_count",
+                    None,
+                )
+                if torch.is_tensor(gate_value) and torch.is_tensor(grid_has_text):
+                    valid_grid = grid_has_text[:, None, :].expand_as(gate_value)
+                    gate_sum += (gate_value * valid_grid).sum(dim=(0, 2))
+                    native_gate_count += valid_grid.sum(dim=(0, 2))
+                    has_gate_diag = True
+                if torch.is_tensor(grid_has_text) and grid_has_text.any():
+                    _add_diag(
+                        diag_sum,
+                        diag_count,
+                        "text_attention_entropy",
+                        getattr(text_module, "last_attention_entropy", None),
+                    )
+                    _add_diag(
+                        diag_sum,
+                        diag_count,
+                        "gpinet_text_context_rms",
+                        getattr(text_module, "last_context_rms", None),
+                    )
+                    _add_diag(
+                        diag_sum,
+                        diag_count,
+                        "gpinet_text_update_abs_mean",
+                        getattr(text_module, "last_update_abs_mean", None),
+                    )
+                _add_diag(
+                    diag_sum,
+                    diag_count,
+                    "gpinet_text_nonempty_grid_fraction",
+                    grid_has_text.to(torch.float32)
+                    if torch.is_tensor(grid_has_text)
+                    else None,
+                )
+                _add_diag(
+                    diag_sum,
+                    diag_count,
+                    "gpinet_text_reports_per_nonempty_grid",
+                    grid_note_count[grid_has_text]
+                    if torch.is_tensor(grid_note_count)
+                    and torch.is_tensor(grid_has_text)
+                    else None,
+                )
+                observed = mask.to(torch.bool)
+                _add_diag(
+                    diag_sum,
+                    diag_count,
+                    "text_correction_abs_mean",
+                    correction.abs()[observed],
+                )
+                _add_diag(
+                    diag_sum,
+                    diag_count,
+                    "text_correction_abs_max",
+                    correction.abs()[observed].max().reshape(1)
+                    if observed.any()
+                    else None,
+                )
+                _add_diag(
+                    diag_sum,
+                    diag_count,
+                    "text_changed_fraction",
+                    (correction.abs()[observed] > 1e-6).to(torch.float32),
+                )
+            elif mmf is not None:
                 relevance = getattr(mmf, "last_variable_relevance", None)
                 gate_value = getattr(mmf, "last_gate", None)
                 null_value = getattr(mmf, "last_null_probability", None)
@@ -534,14 +644,15 @@ def evaluation(
                 if supports_null and torch.is_tensor(null_value):
                     null_probability_sum += (null_value * mask).sum(dim=(0, 1))
                     has_null_probability_diag = True
-            _collect_fusion_diagnostics(
-                fusion,
-                mask,
-                diag_sum,
-                diag_count,
-                target=target,
-                base_prediction=base_pred,
-            )
+            if not native_text and fusion is not None:
+                _collect_fusion_diagnostics(
+                    fusion,
+                    mask,
+                    diag_sum,
+                    diag_count,
+                    target=target,
+                    base_prediction=base_pred,
+                )
 
     if fused_se_sum is None:
         raise ValueError("Evaluation dataloader produced no batches")
@@ -608,11 +719,17 @@ def evaluation(
                 relevance_var,
             )
         if has_gate_diag:
-            gate_var = gate_sum / mask_count.clamp_min(1e-8)
+            gate_denominator = (
+                native_gate_count
+                if native_gate_count is not None and native_gate_count.sum() > 0
+                else mask_count
+            )
+            gate_var = gate_sum / gate_denominator.clamp_min(1e-8)
             results["text_gate_per_variable"] = _to_named_dict(
                 names,
                 gate_var,
             )
+            results["text_gate_mean"] = gate_var.mean().item()
         if has_null_probability_diag:
             null_probability_var = (
                 null_probability_sum / mask_count.clamp_min(1e-8)

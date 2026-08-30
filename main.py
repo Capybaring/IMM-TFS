@@ -713,6 +713,15 @@ def get_args_from_parser() -> argparse.Namespace:
         help="Number of attention heads for Fusion modules",
     )
     parser.add_argument(
+        "--gpinet_query_points",
+        type=int,
+        default=8,
+        help=(
+            "Number of historical GP grid points used by GPINet. Native "
+            "text reports are aligned to this same grid."
+        ),
+    )
+    parser.add_argument(
         "--gpinet_text_gate_bias",
         type=float,
         default=-1.0,
@@ -842,6 +851,8 @@ def get_args_from_parser() -> argparse.Namespace:
         parser.error("--fusion_gate_warmup_value must be in (0, 1]")
     if args.fusion_lr_multiplier <= 0:
         parser.error("--fusion_lr_multiplier must be > 0")
+    if args.gpinet_query_points < 2:
+        parser.error("--gpinet_query_points must be >= 2")
     if (
         args.enable_text
         and args.TTF_module == "TTF_SemTime_Slots"
@@ -1117,14 +1128,15 @@ def trainable(
     model_class = _load_model_class(args.model)
     model = model_class(args).to(args.device)
 
-    # IMM-TFS-style multimodal routing:
-    # GPINet-origin is a numeric-only forecasting backbone. When text is
-    # enabled, the generic FusionModel consumes the timestamped text inputs
-    # and fuses them with GPINet's numerical predictions after forecasting,
-    # exactly like the other IMM-TFS benchmark backbones.
+    # GPINet with pre-computed embeddings owns its text path: reports are
+    # aligned to the historical GP grid and fused before MTGNN. Other models
+    # (and raw-text GPINet runs) keep the benchmark's external FusionModel.
+    native_text_fusion = bool(
+        args.enable_text and getattr(model, "native_text_enabled", False)
+    )
     fusion = (
         FusionModel(args).to(args.device)
-        if args.enable_text
+        if args.enable_text and not native_text_fusion
         else None
     )
 
@@ -1152,14 +1164,30 @@ def trainable(
     logger.info(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     logger.info(input_command)
     logger.info(args)
+    if native_text_fusion:
+        logger.info(
+            "Text route: GPINet native historical-grid fusion before MTGNN"
+        )
+    elif fusion is not None:
+        logger.info("Text route: external TTF/MMF prediction fusion")
 
-    # This is the common optimizer protocol used by every TTF/MMF pair.
-    # GPINet keeps its original regularization; fusion uses the same 2x
-    # learning-rate multiplier and zero weight decay as the first comparison.
-    model_parameters = list(model.parameters())
-    fusion_parameters = list(fusion.parameters()) if fusion is not None else []
-    trainable_parameters = model_parameters + fusion_parameters
-    if fusion_parameters:
+    # Keep the text branch on the same optimizer protocol as external TTF/MMF:
+    # 2x learning rate, no weight decay, and independent gradient clipping.
+    native_text_parameters = (
+        list(model.text_grid_fusion.parameters())
+        if native_text_fusion
+        else []
+    )
+    native_text_parameter_ids = {id(p) for p in native_text_parameters}
+    model_parameters = [
+        p for p in model.parameters() if id(p) not in native_text_parameter_ids
+    ]
+    external_fusion_parameters = (
+        list(fusion.parameters()) if fusion is not None else []
+    )
+    text_parameters = native_text_parameters + external_fusion_parameters
+    trainable_parameters = model_parameters + text_parameters
+    if text_parameters:
         optimizer = optim.Adam(
             [
                 {
@@ -1167,7 +1195,7 @@ def trainable(
                     "weight_decay": args.w_decay,
                 },
                 {
-                    "params": fusion_parameters,
+                    "params": text_parameters,
                     "weight_decay": 0.0,
                     "lr": args.lr * args.fusion_lr_multiplier,
                 },
@@ -1186,14 +1214,20 @@ def trainable(
         # clipping can suppress the fusion gradient when the backbone norm is
         # much larger.
         torch.nn.utils.clip_grad_norm_(model_parameters, max_norm=1.0)
-        if fusion_parameters:
-            torch.nn.utils.clip_grad_norm_(fusion_parameters, max_norm=1.0)
+        if text_parameters:
+            torch.nn.utils.clip_grad_norm_(text_parameters, max_norm=1.0)
 
     def _log_fusion_bootstrap(epoch, step, batch_dict):
-        if fusion is None or epoch != 0 or step >= 3:
+        if epoch != 0 or step >= 3:
             return
-        mmf = getattr(fusion, "mmf", None)
-        delta_out = getattr(mmf, "delta_out", None)
+        if native_text_fusion:
+            text_module = model.text_grid_fusion
+            delta_out = text_module.context_proj[-1]
+            prefix = "GPINetTextBootstrap"
+        else:
+            mmf = getattr(fusion, "mmf", None)
+            delta_out = getattr(mmf, "delta_out", None)
+            prefix = "FusionBootstrap"
         if delta_out is None:
             return
         grad = delta_out.weight.grad
@@ -1208,7 +1242,7 @@ def trainable(
             total_samples = int(note_mask.shape[0])
             real_notes = int(note_mask.sum().item())
         print(
-            f"[FusionBootstrap] epoch={epoch} step={step} "
+            f"[{prefix}] epoch={epoch} step={step} "
             f"text_samples={text_samples}/{total_samples} "
             f"real_notes={real_notes} delta_grad_mean={grad_mean:.3e} "
             f"delta_grad_max={grad_max:.3e} "
@@ -1249,12 +1283,23 @@ def trainable(
     for itr in range(args.epoch):
         st = time.time()
 
+        model_epoch_setter = getattr(model, "set_training_epoch", None)
+        if callable(model_epoch_setter):
+            model_epoch_setter(itr)
         if fusion is not None:
             fusion.set_training_epoch(itr)
-        gate_warmup_epochs = int(
-            getattr(getattr(fusion, "mmf", None), "gate_warmup_epochs", 0)
+        if native_text_fusion:
+            gate_warmup_epochs = int(
+                getattr(model.text_grid_fusion, "warmup_epochs", 0)
+            )
+        else:
+            gate_warmup_epochs = int(
+                getattr(getattr(fusion, "mmf", None), "gate_warmup_epochs", 0)
+            )
+        gate_warmup_active = (
+            (native_text_fusion or fusion is not None)
+            and itr < gate_warmup_epochs
         )
-        gate_warmup_active = fusion is not None and itr < gate_warmup_epochs
 
         ### Training ###
         model.train()
