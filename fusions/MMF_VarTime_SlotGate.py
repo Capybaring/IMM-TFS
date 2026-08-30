@@ -1,4 +1,4 @@
-# BUILD_ID: variable-time-note-cross-attention-paper-gr-add-v3-20260830
+# BUILD_ID: variable-time-note-cross-attention-paper-head-v4-20260830
 import math
 
 import torch
@@ -29,10 +29,10 @@ class MMF_VarTime_SlotGate(nn.Module):
     module no longer performs semantic-slot classification, hard routing, a
     NULL categorical decision, or indirect variable-graph propagation.
     Instead, every variable/future-time query softly attends to all aligned
-    real notes.  The resulting variable-specific contexts replace the paper's
-    single global text vector; prediction fusion itself follows MMF_GR_Add:
-    a joint GRU predicts a normalized residual and a learned gate controls how
-    much of that residual is added to the numerical forecast.
+    real notes.  This variable-time cross-attention replaces the paper's GRU.
+    Downstream prediction fusion still follows MMF_GR_Add: a linear residual
+    head, channel-wise LayerNorm, Dropout, the same 1-sigmoid text gate, and
+    residual addition to the numerical forecast.
 
     Preferred shapes:
         Y_ts:  (B, T, C)
@@ -97,8 +97,9 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.d_attn = int(d_attn)
         self.n_heads = int(n_heads_fusion)
         self.head_dim = self.d_attn // self.n_heads
-        # Kept only so existing CLI/configuration objects remain compatible.
-        # Paper-style GR-Add fusion does not use kappa or gate warmup.
+        # ``kappa`` is kept only for CLI/configuration compatibility because
+        # paper-style GR-Add does not use it.  Gate warmup remains enabled for
+        # the current training protocol as requested.
         self.kappa = float(kappa)
         self.legacy_delta_init_std = float(delta_init_std)
         self.gate_warmup_epochs = int(gate_warmup_epochs)
@@ -125,19 +126,14 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.context_out = nn.Linear(self.d_attn, self.d_attn, bias=False)
         self.context_norm = nn.LayerNorm(self.d_attn)
 
-        # Keep the paper MMF_GR_Add prediction-fusion architecture.  The only
-        # change at this boundary is that its one global text vector is
-        # replaced by C variable-specific cross-attention contexts.
-        self.fusion_dim = self.C + self.C * self.d_attn
-        self.gru = nn.GRU(
-            input_size=self.fusion_dim,
-            hidden_size=self.C,
-            batch_first=True,
-        )
-        self.residual_head = nn.Linear(self.C, self.C)
+        # Cross-attention replaces the paper GRU.  Its per-variable query and
+        # attended text context form the representation consumed by the same
+        # style of linear residual head and gate used by MMF_GR_Add.
+        self.fusion_dim = 2 * self.d_attn
+        self.residual_head = nn.Linear(self.fusion_dim, 1)
         self.layer_norm = nn.LayerNorm(self.C)
         self.residual_dropout = nn.Dropout(dropout)
-        self.gate_net = nn.Linear(self.fusion_dim, self.C)
+        self.gate_net = nn.Linear(self.fusion_dim, 1)
 
         # The old per-variable residual MLP and its custom gate bias are no
         # longer part of the forward graph.  Preserve the value for experiment
@@ -354,28 +350,32 @@ class MMF_VarTime_SlotGate(nn.Module):
             context = context_heads.reshape(B, T, C, self.d_attn)
             context = self.context_norm(self.context_out(context))
 
-        # Paper MMF_GR_Add prediction fusion.  Flattening only the variable
-        # axis preserves each variable's independently attended text context
-        # while allowing the GRU to model future-time and cross-variable
-        # dependencies jointly.
-        fusion_input = torch.cat(
-            [Y_ts, context.reshape(B, T, C * self.d_attn)],
-            dim=-1,
-        )
-        hidden, _ = self.gru(fusion_input)
-        delta_y = self.residual_head(hidden)
+        # Variable-time attention is the learned fusion operator that replaces
+        # the paper GRU.  Everything below follows the paper GR-Add output
+        # fusion: linear residual, LayerNorm, Dropout, gate, and residual add.
+        fusion_features = torch.cat([query, context], dim=-1)
+        delta_y = self.residual_head(fusion_features).squeeze(-1)
         delta_norm = self.layer_norm(delta_y)
         delta_drop = self.residual_dropout(delta_norm)
 
         # Keep the same gate orientation as MMF_GR_Add: sigmoid(gate_logits)
         # is the base-preservation gate and 1-g is the effective text gate.
-        base_gate = torch.sigmoid(self.gate_net(fusion_input))
-        base_gate = torch.where(
-            text_mask.to(torch.bool),
-            base_gate,
-            torch.ones_like(base_gate),
+        base_gate = torch.sigmoid(
+            self.gate_net(fusion_features).squeeze(-1)
         )
-        gate = 1.0 - base_gate
+        learned_gate = 1.0 - base_gate
+        warmup_active = (
+            self.training
+            and self.training_epoch < self.gate_warmup_epochs
+        )
+        if warmup_active:
+            gate = torch.full_like(
+                learned_gate,
+                self.gate_warmup_value,
+            )
+        else:
+            gate = learned_gate
+        gate = gate * text_mask
         candidate_correction = delta_drop * text_mask
         correction = gate * candidate_correction
         Y_out = Y_ts + correction
@@ -398,6 +398,6 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.last_active_slot_mask = note_mask.detach()
         self.last_hard_slot_choice = None
         self.last_variable_adjacency = Y_ts.new_zeros(C, C)
-        self.last_gate_warmup_active = False
+        self.last_gate_warmup_active = bool(warmup_active)
 
         return Y_out
