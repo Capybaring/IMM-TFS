@@ -1,4 +1,4 @@
-# BUILD_ID: variable-time-note-cross-attention-v1-20260830
+# BUILD_ID: variable-time-note-cross-attention-ln-residual-v2-20260830
 import math
 
 import torch
@@ -131,6 +131,11 @@ class MMF_VarTime_SlotGate(nn.Module):
             mean=0.0,
             std=float(delta_init_std),
         )
+        # Normalize the jointly produced C-variable residual at each future
+        # time, following the paper GRU residual head.  ``kappa`` remains a
+        # global residual scale for controlled ablations, but it is no longer
+        # a per-element hard bound as it was in kappa * tanh(raw_delta).
+        self.delta_norm = nn.LayerNorm(self.C)
 
         self.gate_net = nn.Linear(2 * self.d_attn, 1)
         nn.init.constant_(self.gate_net.bias, float(gate_bias))
@@ -347,9 +352,10 @@ class MMF_VarTime_SlotGate(nn.Module):
             context = self.context_norm(self.context_out(context))
 
         delta_features = torch.cat([context, query * context], dim=-1)
-        delta_text = torch.tanh(
-            self.delta_out(self.delta_hidden(delta_features)).squeeze(-1)
-        )
+        raw_delta = self.delta_out(
+            self.delta_hidden(delta_features)
+        ).squeeze(-1)
+        delta_text = self.delta_norm(raw_delta)
 
         learned_gate = torch.sigmoid(
             self.gate_net(torch.cat([query, context], dim=-1)).squeeze(-1)
