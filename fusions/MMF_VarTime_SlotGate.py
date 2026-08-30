@@ -1,4 +1,4 @@
-# BUILD_ID: variable-time-note-cross-attention-ln-residual-v2-20260830
+# BUILD_ID: variable-time-note-cross-attention-paper-gr-add-v3-20260830
 import math
 
 import torch
@@ -29,8 +29,10 @@ class MMF_VarTime_SlotGate(nn.Module):
     module no longer performs semantic-slot classification, hard routing, a
     NULL categorical decision, or indirect variable-graph propagation.
     Instead, every variable/future-time query softly attends to all aligned
-    real notes.  A learned continuous gate controls whether the resulting text
-    residual should affect that variable.
+    real notes.  The resulting variable-specific contexts replace the paper's
+    single global text vector; prediction fusion itself follows MMF_GR_Add:
+    a joint GRU predicts a normalized residual and a learned gate controls how
+    much of that residual is added to the numerical forecast.
 
     Preferred shapes:
         Y_ts:  (B, T, C)
@@ -95,7 +97,10 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.d_attn = int(d_attn)
         self.n_heads = int(n_heads_fusion)
         self.head_dim = self.d_attn // self.n_heads
+        # Kept only so existing CLI/configuration objects remain compatible.
+        # Paper-style GR-Add fusion does not use kappa or gate warmup.
         self.kappa = float(kappa)
+        self.legacy_delta_init_std = float(delta_init_std)
         self.gate_warmup_epochs = int(gate_warmup_epochs)
         self.gate_warmup_value = float(gate_warmup_value)
         self.training_epoch = 0
@@ -120,25 +125,24 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.context_out = nn.Linear(self.d_attn, self.d_attn, bias=False)
         self.context_norm = nn.LayerNorm(self.d_attn)
 
-        self.delta_hidden = nn.Sequential(
-            nn.Linear(2 * self.d_attn, self.d_attn, bias=False),
-            nn.GELU(),
-            nn.Dropout(dropout),
+        # Keep the paper MMF_GR_Add prediction-fusion architecture.  The only
+        # change at this boundary is that its one global text vector is
+        # replaced by C variable-specific cross-attention contexts.
+        self.fusion_dim = self.C + self.C * self.d_attn
+        self.gru = nn.GRU(
+            input_size=self.fusion_dim,
+            hidden_size=self.C,
+            batch_first=True,
         )
-        self.delta_out = nn.Linear(self.d_attn, 1, bias=False)
-        nn.init.normal_(
-            self.delta_out.weight,
-            mean=0.0,
-            std=float(delta_init_std),
-        )
-        # Normalize the jointly produced C-variable residual at each future
-        # time, following the paper GRU residual head.  ``kappa`` remains a
-        # global residual scale for controlled ablations, but it is no longer
-        # a per-element hard bound as it was in kappa * tanh(raw_delta).
-        self.delta_norm = nn.LayerNorm(self.C)
+        self.residual_head = nn.Linear(self.C, self.C)
+        self.layer_norm = nn.LayerNorm(self.C)
+        self.residual_dropout = nn.Dropout(dropout)
+        self.gate_net = nn.Linear(self.fusion_dim, self.C)
 
-        self.gate_net = nn.Linear(2 * self.d_attn, 1)
-        nn.init.constant_(self.gate_net.bias, float(gate_bias))
+        # The old per-variable residual MLP and its custom gate bias are no
+        # longer part of the forward graph.  Preserve the value for experiment
+        # metadata/checkpoint diagnostics only.
+        self.legacy_gate_bias = float(gate_bias)
 
         # Evaluation capability flags.
         self.supports_null_diagnostic = False
@@ -279,10 +283,9 @@ class MMF_VarTime_SlotGate(nn.Module):
         has_text = note_mask.any(dim=-1)
         text_mask = has_text.unsqueeze(-1).to(Y_ts.dtype)
 
-        # Keep the fusion query from becoming an indirect gradient path into
-        # the numerical backbone.  Y_out = Y_ts + correction still preserves
-        # the normal identity gradient to the base forecast.
-        numeric_source = Y_ts.detach()
+        # Match the paper's end-to-end fusion: the GRU/gate/attention paths may
+        # all backpropagate into the numerical forecasting backbone.
+        numeric_source = Y_ts
         local_state = self.local_value_proj(numeric_source.unsqueeze(-1))
         global_state = self.global_state_proj(numeric_source).unsqueeze(2)
         variable_state = self.variable_embedding.view(1, 1, C, self.d_attn)
@@ -351,26 +354,29 @@ class MMF_VarTime_SlotGate(nn.Module):
             context = context_heads.reshape(B, T, C, self.d_attn)
             context = self.context_norm(self.context_out(context))
 
-        delta_features = torch.cat([context, query * context], dim=-1)
-        raw_delta = self.delta_out(
-            self.delta_hidden(delta_features)
-        ).squeeze(-1)
-        delta_text = self.delta_norm(raw_delta)
-
-        learned_gate = torch.sigmoid(
-            self.gate_net(torch.cat([query, context], dim=-1)).squeeze(-1)
+        # Paper MMF_GR_Add prediction fusion.  Flattening only the variable
+        # axis preserves each variable's independently attended text context
+        # while allowing the GRU to model future-time and cross-variable
+        # dependencies jointly.
+        fusion_input = torch.cat(
+            [Y_ts, context.reshape(B, T, C * self.d_attn)],
+            dim=-1,
         )
-        warmup_active = (
-            self.training
-            and self.training_epoch < self.gate_warmup_epochs
-        )
-        if warmup_active:
-            gate = torch.full_like(learned_gate, self.gate_warmup_value)
-        else:
-            gate = learned_gate
-        gate = gate * text_mask
+        hidden, _ = self.gru(fusion_input)
+        delta_y = self.residual_head(hidden)
+        delta_norm = self.layer_norm(delta_y)
+        delta_drop = self.residual_dropout(delta_norm)
 
-        candidate_correction = self.kappa * delta_text * text_mask
+        # Keep the same gate orientation as MMF_GR_Add: sigmoid(gate_logits)
+        # is the base-preservation gate and 1-g is the effective text gate.
+        base_gate = torch.sigmoid(self.gate_net(fusion_input))
+        base_gate = torch.where(
+            text_mask.to(torch.bool),
+            base_gate,
+            torch.ones_like(base_gate),
+        )
+        gate = 1.0 - base_gate
+        candidate_correction = delta_drop * text_mask
         correction = gate * candidate_correction
         Y_out = Y_ts + correction
         self._require_finite("fused forecast", Y_out)
@@ -382,7 +388,7 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.last_null_probability = zeros.detach()
         self.last_gate = gate.detach()
         self.last_variable_relevance = gate.detach()
-        self.last_delta = delta_text.detach()
+        self.last_delta = delta_drop.detach()
         self.last_correction = correction.detach()
         self.last_candidate_correction = candidate_correction.detach()
         self.last_direct_correction = correction.detach()
@@ -392,6 +398,6 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.last_active_slot_mask = note_mask.detach()
         self.last_hard_slot_choice = None
         self.last_variable_adjacency = Y_ts.new_zeros(C, C)
-        self.last_gate_warmup_active = bool(warmup_active)
+        self.last_gate_warmup_active = False
 
         return Y_out
