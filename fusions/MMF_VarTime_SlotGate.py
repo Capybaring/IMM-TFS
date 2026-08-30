@@ -1,4 +1,4 @@
-# BUILD_ID: active-slot-null-routing-v10-20260829
+# BUILD_ID: zero-value-null-attention-v11-20260830
 import math
 
 import torch
@@ -24,9 +24,10 @@ class MMF_VarTime_SlotGate(nn.Module):
 
     Each variable-time query chooses among the semantic slots that are actually
     populated for the current patient plus a learned NULL/no-match option.
-    Empty slots never participate in attention.  After a short warmup,
-    ``1 - p(NULL)`` is the sole text-relevance factor; there is no independent
-    gate network competing with the residual branch for the same role.
+    Empty slots never participate in attention.  NULL has a fixed zero value,
+    so its probability directly removes mass from the textual context.  The
+    correction is produced from that already attenuated context and is never
+    multiplied by a second relevance gate.
 
     Shapes:
         Y_ts:  (B, T, C)
@@ -286,21 +287,14 @@ class MMF_VarTime_SlotGate(nn.Module):
         )
         null_attention = all_attention[..., slot_count]
 
-        # Separate correspondence from relevance.  Conditional real-slot
-        # attention answers "which active slot?"; NULL mass answers "does any
-        # active slot correspond at all?".  This avoids attenuating the text
-        # context twice.
+        # Conditional real-slot weights are used only to preserve the existing
+        # fixed non-zero warmup.  After warmup, the raw real attention is used:
+        # the omitted probability belongs to the zero-valued NULL option and
+        # therefore attenuates context exactly once.
         conditional_attention = real_attention / real_attention.sum(
             dim=-1,
             keepdim=True,
         ).clamp_min(1e-8)
-
-        context_heads = torch.einsum(
-            "btchs,btshd->btchd",
-            conditional_attention.to(v_heads.dtype),
-            v_heads,
-        )
-        context = context_heads.reshape(B, T, C, self.d_attn)
 
         null_probability = null_attention.mean(dim=-1).to(Y_ts.dtype)
         learned_relevance = (1.0 - null_probability).clamp(0.0, 1.0)
@@ -320,9 +314,23 @@ class MMF_VarTime_SlotGate(nn.Module):
         else:
             variable_relevance = learned_relevance
 
-        # ``gate`` is kept as a diagnostic/API name.  It is no longer produced
-        # by a separate network; it is exactly the non-NULL correspondence
-        # probability (or the fixed warmup value) under the sample text mask.
+        if warmup_active:
+            effective_real_attention = (
+                conditional_attention * self.gate_warmup_value
+            )
+        else:
+            effective_real_attention = real_attention
+
+        context_heads = torch.einsum(
+            "btchs,btshd->btchd",
+            effective_real_attention.to(v_heads.dtype),
+            v_heads,
+        )
+        context = context_heads.reshape(B, T, C, self.d_attn)
+
+        # Kept only as an interpretable diagnostic/API value.  It does not
+        # multiply the residual correction; NULL already suppresses context by
+        # taking attention mass away from the real values above.
         gate = variable_relevance * text_mask
 
         delta_features = torch.cat([context, query * context], dim=-1)
@@ -331,7 +339,7 @@ class MMF_VarTime_SlotGate(nn.Module):
         )
 
         candidate_correction = self.kappa * delta_text * text_mask
-        correction = gate * candidate_correction
+        correction = candidate_correction
         Y_out = Y_ts + correction
 
         diagnostic_attention = all_attention.mean(dim=-2).to(Y_ts.dtype)
