@@ -715,7 +715,7 @@ def get_args_from_parser() -> argparse.Namespace:
     parser.add_argument(
         "--gpinet_query_points",
         type=int,
-        default=8,
+        default=24,
         help=(
             "Number of historical GP grid points used by GPINet. Native "
             "text reports are aligned to this same grid."

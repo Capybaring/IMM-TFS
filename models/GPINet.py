@@ -178,6 +178,7 @@ class HistoricalGridTextFusion(nn.Module):
         hidden,
         num_nodes,
         t_query,
+        history_window,
         total_window,
         n_heads=1,
         dropout=0.1,
@@ -193,8 +194,10 @@ class HistoricalGridTextFusion(nn.Module):
                 f"GPINet text hidden size {hidden} must be divisible by "
                 f"n_heads_fusion={n_heads}"
             )
-        if total_window <= 0:
-            raise ValueError("history + pred_window must be positive")
+        if total_window <= 0 or history_window <= 0:
+            raise ValueError("history and history + pred_window must be positive")
+        if history_window > total_window:
+            raise ValueError("history cannot exceed history + pred_window")
         if not 0.0 < warmup_value <= 1.0:
             raise ValueError("warmup_value must be in (0, 1]")
 
@@ -203,6 +206,7 @@ class HistoricalGridTextFusion(nn.Module):
         self.n_heads = int(n_heads)
         self.head_dim = self.hidden // self.n_heads
         self.total_window = float(total_window)
+        self.history_end = float(history_window) / self.total_window
         self.warmup_epochs = max(0, int(warmup_epochs))
         self.warmup_value = float(warmup_value)
         self.current_epoch = 0
@@ -317,7 +321,11 @@ class HistoricalGridTextFusion(nn.Module):
         note_mask = torch.isfinite(notes_input).all(dim=-1)
         note_mask = note_mask & (notes_input.abs().sum(dim=-1) > 0)
         tau_norm = tau_raw / self.total_window
-        history_end = self.t_query[-1].to(tau_norm.dtype)
+        # The original GPINet grid represents [0, history) (0..23 h for the
+        # 24 h MIMIC history), so the final query is one step before the true
+        # history boundary. Use the boundary rather than t_query[-1] when
+        # validating reports, otherwise notes from the final hour are lost.
+        history_end = tau_norm.new_tensor(self.history_end)
         note_mask = (
             note_mask
             & torch.isfinite(tau_norm)
@@ -544,10 +552,15 @@ class GPINet(nn.Module):
         self.te_dim = args.te_dim
 
         history_frac = float(args.history) / float(args.history + args.pred_window)
-        n_query = int(getattr(args, "gpinet_query_points", 8))
+        # Restore the original GPINet convention: Q defaults to the prediction
+        # horizon (24 for expanded MIMIC), with query points covering [0, H)
+        # rather than including the H=24 boundary.
+        n_query = int(getattr(args, "gpinet_query_points", 0)) or int(
+            args.pred_window
+        )
         if n_query < 2:
             raise ValueError("GPINet requires at least two historical query points")
-        t_query = torch.linspace(0.0, history_frac, n_query)
+        t_query = torch.linspace(0.0, history_frac, n_query + 1)[:n_query]
 
         self.gp = BatchedGPInterpolator(
             self.N,
@@ -603,6 +616,7 @@ class GPINet(nn.Module):
                     hidden=self.hid_dim,
                     num_nodes=self.N,
                     t_query=t_query,
+                    history_window=float(args.history),
                     total_window=float(args.history + args.pred_window),
                     n_heads=int(getattr(args, "n_heads_fusion", 1)),
                     dropout=float(args.dropout),
