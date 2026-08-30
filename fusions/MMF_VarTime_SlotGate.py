@@ -1,8 +1,9 @@
-# BUILD_ID: zero-value-null-attention-v11-20260830
+# BUILD_ID: strict-direct-indirect-slot-routing-v12-20260830
 import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class FutureTime2Vec(nn.Module):
@@ -20,14 +21,20 @@ class FutureTime2Vec(nn.Module):
 
 
 class MMF_VarTime_SlotGate(nn.Module):
-    """Variable-time residual fusion with active-slot/NULL routing.
+    """Strict direct slot matching plus limited indirect variable propagation.
 
-    Each variable-time query chooses among the semantic slots that are actually
-    populated for the current patient plus a learned NULL/no-match option.
-    Empty slots never participate in attention.  NULL has a fixed zero value,
-    so its probability directly removes mass from the textual context.  The
-    correction is produced from that already attenuated context and is never
-    multiplied by a second relevance gate.
+    After warmup, every variable-time query makes one deterministic categorical
+    choice among the populated semantic slots and a learned NULL/no-match
+    option.  A real choice produces a direct correction from exactly one slot;
+    a NULL choice produces exactly zero direct correction.  Straight-through
+    routing keeps this hard forward decision trainable without adding an outer
+    supervision loss.
+
+    A small second path permits realistic indirect effects.  Direct corrections
+    are propagated through a learned, zero-diagonal variable graph only to
+    variables that chose NULL.  Consequently an unmatched slot cannot directly
+    alter that variable, and the indirect contribution remains separately
+    observable and bounded by ``indirect_strength``.
 
     Shapes:
         Y_ts:  (B, T, C)
@@ -50,6 +57,8 @@ class MMF_VarTime_SlotGate(nn.Module):
         gate_warmup_epochs: int = 5,
         gate_warmup_value: float = 0.5,
         null_logit_bias: float | None = None,
+        indirect_strength: float = 0.1,
+        indirect_temperature: float = 0.5,
     ):
         super().__init__()
 
@@ -79,6 +88,10 @@ class MMF_VarTime_SlotGate(nn.Module):
             raise ValueError("gate_warmup_epochs must be >= 0")
         if not 0.0 < gate_warmup_value <= 1.0:
             raise ValueError("gate_warmup_value must be in (0, 1]")
+        if not 0.0 <= indirect_strength <= 1.0:
+            raise ValueError("indirect_strength must be in [0, 1]")
+        if indirect_temperature <= 0.0:
+            raise ValueError("indirect_temperature must be > 0")
 
         self.C = int(C)
         self.d_txt = int(d_txt)
@@ -90,6 +103,8 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.kappa = float(kappa)
         self.gate_warmup_epochs = int(gate_warmup_epochs)
         self.gate_warmup_value = float(gate_warmup_value)
+        self.indirect_strength = float(indirect_strength)
+        self.indirect_temperature = float(indirect_temperature)
         self.training_epoch = 0
         # Reuse the existing runner knob for backward-compatible experiment
         # configuration: mmf_slot_gate_bias now initializes the NULL logit.
@@ -124,6 +139,8 @@ class MMF_VarTime_SlotGate(nn.Module):
             torch.tensor(float(null_logit_bias), dtype=torch.float32)
         )
         self.supports_null_diagnostic = True
+        self.supports_strict_slot_routing = True
+        self.supports_indirect_diagnostic = True
 
         self.delta_hidden = nn.Sequential(
             nn.Linear(2 * self.d_attn, self.d_attn, bias=False),
@@ -144,9 +161,13 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.last_delta = None
         self.last_correction = None
         self.last_candidate_correction = None
+        self.last_direct_correction = None
+        self.last_indirect_correction = None
         self.last_text_mask = None
         self.last_context = None
         self.last_active_slot_mask = None
+        self.last_hard_slot_choice = None
+        self.last_variable_adjacency = None
         self.last_gate_warmup_active = False
 
     def set_training_epoch(self, epoch: int) -> None:
@@ -239,6 +260,10 @@ class MMF_VarTime_SlotGate(nn.Module):
         time_state = self.time_proj(
             self.time2vec(t_hat.unsqueeze(-1))
         ).unsqueeze(2)
+        # Slot correspondence is decided from variable identity and forecast
+        # time.  Numerical state is deliberately excluded from this classifier
+        # so a base-prediction bias cannot masquerade as semantic matching.
+        routing_query = self.query_norm(variable_state + time_state)
         query = self.query_norm(
             local_state + global_state + variable_state + time_state
         )
@@ -247,7 +272,9 @@ class MMF_VarTime_SlotGate(nn.Module):
         real_values = self.slot_value(E_slots)
 
         slot_count = self.semantic_slots
-        q_heads = query.reshape(B, T, C, self.n_heads, self.head_dim)
+        routing_q_heads = routing_query.reshape(
+            B, T, C, self.n_heads, self.head_dim
+        )
         k_heads = real_keys.reshape(
             B, T, slot_count, self.n_heads, self.head_dim
         )
@@ -256,7 +283,7 @@ class MMF_VarTime_SlotGate(nn.Module):
         )
 
         scores = torch.einsum(
-            "btchd,btshd->btchs", q_heads, k_heads
+            "btchd,btshd->btchs", routing_q_heads, k_heads
         ) / math.sqrt(self.head_dim)
 
         # Empty real slots are invalid classes.  NULL is always valid, so even
@@ -272,7 +299,7 @@ class MMF_VarTime_SlotGate(nn.Module):
         ).float()
         null_scores = torch.einsum(
             "btchd,hd->btch",
-            q_heads.float(),
+            routing_q_heads.float(),
             null_key_heads,
         ) / math.sqrt(self.head_dim)
         null_scores = null_scores + self.null_logit_bias.float()
@@ -280,23 +307,39 @@ class MMF_VarTime_SlotGate(nn.Module):
             [real_scores, null_scores.unsqueeze(-1)],
             dim=-1,
         )
-        all_attention = torch.softmax(all_scores, dim=-1)
-        real_attention = all_attention[..., :slot_count]
-        real_attention = real_attention * active_slot_mask.to(
-            real_attention.dtype
-        )
-        null_attention = all_attention[..., slot_count]
+        # Average head evidence before classification so each variable-time
+        # pair makes exactly one semantic decision even when multiple attention
+        # heads are configured.
+        routing_logits = all_scores.mean(dim=-2)
+        soft_routing = torch.softmax(routing_logits, dim=-1)
+        hard_choice = soft_routing.argmax(dim=-1)
+        hard_routing = F.one_hot(
+            hard_choice,
+            num_classes=slot_count + 1,
+        ).to(soft_routing.dtype)
+
+        # Straight-through argmax: the forward path is strictly one-hot while
+        # the backward path follows the corresponding softmax probabilities.
+        if self.training:
+            strict_routing = (
+                hard_routing + soft_routing - soft_routing.detach()
+            )
+        else:
+            strict_routing = hard_routing
+
+        soft_real_attention = soft_routing[..., :slot_count]
+        soft_null_attention = soft_routing[..., slot_count]
 
         # Conditional real-slot weights are used only to preserve the existing
         # fixed non-zero warmup.  After warmup, the raw real attention is used:
         # the omitted probability belongs to the zero-valued NULL option and
         # therefore attenuates context exactly once.
-        conditional_attention = real_attention / real_attention.sum(
+        conditional_attention = soft_real_attention / soft_real_attention.sum(
             dim=-1,
             keepdim=True,
         ).clamp_min(1e-8)
 
-        null_probability = null_attention.mean(dim=-1).to(Y_ts.dtype)
+        null_probability = soft_null_attention.to(Y_ts.dtype)
         learned_relevance = (1.0 - null_probability).clamp(0.0, 1.0)
 
         # Preserve the existing protected warmup: real-slot correspondence and
@@ -312,25 +355,27 @@ class MMF_VarTime_SlotGate(nn.Module):
                 self.gate_warmup_value,
             )
         else:
-            variable_relevance = learned_relevance
+            variable_relevance = strict_routing[
+                ..., :slot_count
+            ].sum(dim=-1).to(Y_ts.dtype)
 
         if warmup_active:
             effective_real_attention = (
                 conditional_attention * self.gate_warmup_value
             )
         else:
-            effective_real_attention = real_attention
+            effective_real_attention = strict_routing[..., :slot_count]
 
         context_heads = torch.einsum(
             "btchs,btshd->btchd",
-            effective_real_attention.to(v_heads.dtype),
+            effective_real_attention.unsqueeze(-2).to(v_heads.dtype),
             v_heads,
         )
         context = context_heads.reshape(B, T, C, self.d_attn)
 
-        # Kept only as an interpretable diagnostic/API value.  It does not
-        # multiply the residual correction; NULL already suppresses context by
-        # taking attention mass away from the real values above.
+        # This is now a strict direct-match indicator after warmup: 1 means one
+        # real slot was selected and 0 means NULL.  During protected warmup it
+        # retains the previous fixed non-zero value.
         gate = variable_relevance * text_mask
 
         delta_features = torch.cat([context, query * context], dim=-1)
@@ -338,21 +383,64 @@ class MMF_VarTime_SlotGate(nn.Module):
             self.delta_out(self.delta_hidden(delta_features)).squeeze(-1)
         )
 
-        candidate_correction = self.kappa * delta_text * text_mask
-        correction = candidate_correction
+        direct_correction = self.kappa * delta_text * text_mask
+
+        # Build a learned variable graph from identity embeddings.  Removing
+        # the diagonal prevents this path from duplicating the direct residual.
+        # It is deliberately small and can only write into NULL-routed targets.
+        if self.C > 1 and self.indirect_strength > 0.0 and not warmup_active:
+            variable_direction = F.normalize(
+                self.variable_embedding.float(),
+                dim=-1,
+                eps=1e-8,
+            )
+            adjacency_logits = torch.matmul(
+                variable_direction,
+                variable_direction.transpose(0, 1),
+            ) / self.indirect_temperature
+            diagonal = torch.eye(
+                self.C,
+                device=adjacency_logits.device,
+                dtype=torch.bool,
+            )
+            adjacency = torch.softmax(
+                adjacency_logits.masked_fill(diagonal, -1e4),
+                dim=-1,
+            ).to(direct_correction.dtype)
+            propagated = torch.einsum(
+                "ij,btj->bti",
+                adjacency,
+                direct_correction,
+            )
+            no_direct_match = (1.0 - variable_relevance).clamp(0.0, 1.0)
+            indirect_correction = (
+                self.indirect_strength
+                * propagated
+                * no_direct_match
+                * text_mask
+            )
+        else:
+            adjacency = direct_correction.new_zeros(self.C, self.C)
+            indirect_correction = torch.zeros_like(direct_correction)
+
+        candidate_correction = direct_correction
+        correction = direct_correction + indirect_correction
         Y_out = Y_ts + correction
 
-        diagnostic_attention = all_attention.mean(dim=-2).to(Y_ts.dtype)
-        self.last_slot_attention = diagnostic_attention.detach()
+        self.last_slot_attention = soft_routing.to(Y_ts.dtype).detach()
         self.last_null_probability = null_probability.detach()
         self.last_gate = gate.detach()
-        self.last_variable_relevance = variable_relevance.detach()
+        self.last_variable_relevance = learned_relevance.detach()
         self.last_delta = delta_text.detach()
         self.last_correction = correction.detach()
         self.last_candidate_correction = candidate_correction.detach()
+        self.last_direct_correction = direct_correction.detach()
+        self.last_indirect_correction = indirect_correction.detach()
         self.last_text_mask = text_mask.detach()
         self.last_context = context.detach()
         self.last_active_slot_mask = active_slots.detach()
+        self.last_hard_slot_choice = hard_choice.detach()
+        self.last_variable_adjacency = adjacency.detach()
         self.last_gate_warmup_active = bool(warmup_active)
 
         return Y_out
