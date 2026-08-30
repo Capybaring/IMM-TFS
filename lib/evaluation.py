@@ -468,6 +468,7 @@ def evaluation(
     correction_abs_sum = correction_signed_sum = None
     relevance_sum = gate_sum = null_probability_sum = None
     has_relevance_diag = False
+    has_native_variable_allocation = False
     has_gate_diag = False
     has_null_probability_diag = False
     native_relevance_count = None
@@ -560,11 +561,7 @@ def evaluation(
                     "last_grid_has_text",
                     None,
                 )
-                grid_note_count = getattr(
-                    text_module,
-                    "last_grid_note_count",
-                    None,
-                )
+                note_count = getattr(text_module, "last_note_count", None)
                 if torch.is_tensor(relevance) and torch.is_tensor(membership):
                     valid_relevance = membership.permute(0, 2, 1)[:, None]
                     valid_relevance = valid_relevance.expand_as(relevance)
@@ -576,28 +573,51 @@ def evaluation(
                             dim=(0, 2, 3)
                         )
                         has_relevance_diag = True
+                        has_native_variable_allocation = True
                 if torch.is_tensor(grid_has_text) and grid_has_text.any():
                     _add_diag(
                         diag_sum,
                         diag_count,
-                        "gpinet_text_attention_entropy",
+                        "gpinet_text_variable_attention_entropy",
                         getattr(text_module, "last_attention_entropy", None),
                     )
                     _add_diag(
                         diag_sum,
                         diag_count,
-                        "gpinet_text_attention_max",
+                        "gpinet_text_variable_attention_max",
                         getattr(text_module, "last_attention_max", None),
                     )
                     _add_diag(
                         diag_sum,
                         diag_count,
-                        "gpinet_text_multi_note_grid_fraction",
+                        "gpinet_text_variable_attention_imbalance",
                         getattr(
                             text_module,
-                            "last_multi_note_grid_fraction",
+                            "last_variable_attention_imbalance",
                             None,
                         ),
+                    )
+                    _add_diag(
+                        diag_sum,
+                        diag_count,
+                        "gpinet_text_multi_note_patient_fraction",
+                        getattr(
+                            text_module,
+                            "last_multi_note_patient_fraction",
+                            None,
+                        ),
+                    )
+                    _add_diag(
+                        diag_sum,
+                        diag_count,
+                        "gpinet_text_time_weight_mean",
+                        getattr(text_module, "last_time_weight_mean", None),
+                    )
+                    _add_diag(
+                        diag_sum,
+                        diag_count,
+                        "gpinet_text_time_weight_max",
+                        getattr(text_module, "last_time_weight_max", None),
                     )
                     _add_diag(
                         diag_sum,
@@ -614,7 +634,7 @@ def evaluation(
                 _add_diag(
                     diag_sum,
                     diag_count,
-                    "gpinet_text_nonempty_grid_fraction",
+                    "gpinet_text_active_grid_fraction",
                     grid_has_text.to(torch.float32)
                     if torch.is_tensor(grid_has_text)
                     else None,
@@ -622,10 +642,9 @@ def evaluation(
                 _add_diag(
                     diag_sum,
                     diag_count,
-                    "gpinet_text_reports_per_nonempty_grid",
-                    grid_note_count[grid_has_text]
-                    if torch.is_tensor(grid_note_count)
-                    and torch.is_tensor(grid_has_text)
+                    "gpinet_text_reports_per_patient",
+                    note_count[note_count > 0]
+                    if torch.is_tensor(note_count)
                     else None,
                 )
                 observed = mask.to(torch.bool)
@@ -743,11 +762,19 @@ def evaluation(
                 else mask_count
             )
             relevance_var = relevance_sum / relevance_denominator.clamp_min(1e-8)
-            results["text_relevance_per_variable"] = _to_named_dict(
-                names,
-                relevance_var,
-            )
-            results["text_relevance_mean"] = relevance_var.mean().item()
+            if has_native_variable_allocation:
+                results["text_variable_allocation_per_variable"] = (
+                    _to_named_dict(names, relevance_var)
+                )
+                results["text_variable_allocation_mean"] = (
+                    relevance_var.mean().item()
+                )
+            else:
+                results["text_relevance_per_variable"] = _to_named_dict(
+                    names,
+                    relevance_var,
+                )
+                results["text_relevance_mean"] = relevance_var.mean().item()
         if has_gate_diag:
             gate_var = gate_sum / mask_count.clamp_min(1e-8)
             results["text_gate_per_variable"] = _to_named_dict(

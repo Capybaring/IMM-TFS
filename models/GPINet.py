@@ -142,35 +142,18 @@ class GaussHermiteFusionModule(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Historical text alignment and variable-aware fusion
+# Semantic-variable allocation and time-aware text fusion
 # ─────────────────────────────────────────────────────────────────────────
 
 
-class GridTime2Vec(nn.Module):
-    """Continuous timestamp embedding used by notes and GP grid points."""
-
-    def __init__(self, hidden: int):
-        super().__init__()
-        self.linear = nn.Linear(1, 1)
-        self.periodic = nn.Linear(1, hidden - 1)
-
-    def forward(self, timestamp):
-        timestamp = timestamp.unsqueeze(-1)
-        return torch.cat(
-            [self.linear(timestamp), torch.sin(self.periodic(timestamp))],
-            dim=-1,
-        )
-
-
 class HistoricalGridTextFusion(nn.Module):
-    """Fuse timestamped reports into the matching historical GP grid point.
+    """Factor text influence into semantic-variable and temporal weights.
 
-    Each valid report is assigned to exactly one grid point: the first query
-    time that is not earlier than the report. A query built from the local
-    Gauss-Hermite feature, variable identity, and grid time attends over the
-    reports assigned to that grid with masked softmax. The resulting weighted
-    text feature is added directly to the numeric feature map consumed by
-    MTGNN; there is no post-attention fusion gate.
+    Every report first distributes its semantic content over the variables by
+    softmax across learned variable prototypes. Its original timestamp then
+    produces a Gaussian weight over every historical GP grid point. The outer
+    product of these two weights creates a regular variable-time text feature
+    map that is added directly to the Gauss-Hermite feature before MTGNN.
     """
 
     def __init__(
@@ -183,6 +166,7 @@ class HistoricalGridTextFusion(nn.Module):
         total_window,
         n_heads=1,
         dropout=0.1,
+        time_sigma_hours=4.0,
     ):
         super().__init__()
         if n_heads < 1:
@@ -196,6 +180,8 @@ class HistoricalGridTextFusion(nn.Module):
             raise ValueError("history and history + pred_window must be positive")
         if history_window > total_window:
             raise ValueError("history cannot exceed history + pred_window")
+        if time_sigma_hours <= 0:
+            raise ValueError("GPINet text time sigma must be positive")
 
         self.hidden = int(hidden)
         self.num_nodes = int(num_nodes)
@@ -203,15 +189,11 @@ class HistoricalGridTextFusion(nn.Module):
         self.head_dim = self.hidden // self.n_heads
         self.total_window = float(total_window)
         self.history_end = float(history_window) / self.total_window
+        self.time_sigma_hours = float(time_sigma_hours)
         self.register_buffer("t_query", t_query.detach().float().clone())
 
         self.content_proj = nn.Sequential(
             nn.Linear(int(d_txt), self.hidden),
-            nn.GELU(),
-        )
-        self.time_encoder = GridTime2Vec(self.hidden)
-        self.note_fusion = nn.Sequential(
-            nn.Linear(2 * self.hidden, self.hidden),
             nn.GELU(),
             nn.LayerNorm(self.hidden),
         )
@@ -233,10 +215,14 @@ class HistoricalGridTextFusion(nn.Module):
         self.last_attention = None
         self.last_attention_entropy = None
         self.last_attention_max = None
-        self.last_multi_note_grid_fraction = None
+        self.last_variable_attention_imbalance = None
+        self.last_multi_note_patient_fraction = None
+        self.last_time_weight_mean = None
+        self.last_time_weight_max = None
         self.last_context_rms = None
         self.last_grid_has_text = None
         self.last_grid_note_count = None
+        self.last_note_count = None
         self.last_note_grid_index = None
         self.last_update_abs_mean = None
 
@@ -250,7 +236,10 @@ class HistoricalGridTextFusion(nn.Module):
         self.last_attention = relevance
         self.last_attention_entropy = None
         self.last_attention_max = None
-        self.last_multi_note_grid_fraction = None
+        self.last_variable_attention_imbalance = None
+        self.last_multi_note_patient_fraction = None
+        self.last_time_weight_mean = None
+        self.last_time_weight_max = None
         self.last_membership = torch.zeros(
             batch_size,
             num_notes,
@@ -263,6 +252,7 @@ class HistoricalGridTextFusion(nn.Module):
             batch_size, q, dtype=torch.bool, device=numeric_features.device
         )
         self.last_grid_note_count = numeric_features.new_zeros((batch_size, q))
+        self.last_note_count = numeric_features.new_zeros((batch_size,))
         self.last_note_grid_index = torch.full(
             (batch_size, num_notes),
             -1,
@@ -332,106 +322,108 @@ class HistoricalGridTextFusion(nn.Module):
 
         notes_input = notes_input.masked_fill(~note_mask.unsqueeze(-1), 0)
         tau_norm = tau_norm.masked_fill(~note_mask, 0)
+        tau_hours = tau_raw.masked_fill(~note_mask, 0)
 
-        # Assign every historical report to exactly one causal grid point.
+        # Each report influences every historical grid point through a
+        # Gaussian of its exact timestamp. This is a weighted diffusion, not
+        # uniform replication over the 24-hour grid.
         grid_times = self.t_query.to(
             device=numeric_features.device, dtype=numeric_features.dtype
         )
-        grid_index = torch.searchsorted(
-            grid_times.contiguous(), tau_norm.contiguous(), right=False
-        ).clamp_(0, q - 1)
-        membership = (
-            grid_index.unsqueeze(-1)
-            == torch.arange(q, device=grid_index.device).view(1, 1, q)
-        ) & note_mask.unsqueeze(-1)  # (B, K, Q)
-        grid_has_text = membership.any(dim=1)  # (B, Q)
+        grid_hours = grid_times * self.total_window
+        time_delta = grid_hours.view(1, q, 1).float() - tau_hours.view(
+            b, 1, k
+        ).float()
+        time_weight = torch.exp(
+            -0.5 * (time_delta / self.time_sigma_hours).square()
+        )
+        time_weight = time_weight * note_mask.view(b, 1, k).float()
 
-        note_content = self.content_proj(notes_input)
-        bounded_tau = torch.minimum(tau_norm.clamp_min(0), history_end)
-        note_time = self.time_encoder(bounded_tau)
-        note_token = self.dropout(
-            self.note_fusion(torch.cat([note_content, note_time], dim=-1))
-        )  # (B, K, H)
-
-        # The query is local: numeric GH state + variable identity + grid time.
-        numeric_grid = numeric_features[..., 1:].permute(0, 2, 3, 1)
-        grid_time = self.time_encoder(grid_times).view(1, 1, q, self.hidden)
-        variable = self.variable_embedding.view(1, n, 1, self.hidden)
-        query_token = self.query_norm(numeric_grid + variable + grid_time)
-
+        # Semantic allocation deliberately excludes timestamps: a report is
+        # matched once against all learned variable prototypes, independently
+        # of where it occurred in the history.
+        note_token = self.dropout(self.content_proj(notes_input))
+        query_token = self.query_norm(self.variable_embedding).view(
+            1, n, self.hidden
+        ).expand(b, -1, -1)
         query = self.query_proj(query_token).view(
-            b, n, q, self.n_heads, self.head_dim
+            b, n, self.n_heads, self.head_dim
         )
         key = self.key_proj(note_token).view(b, k, self.n_heads, self.head_dim)
         value = self.value_proj(note_token).view(b, k, self.n_heads, self.head_dim)
-        scores = torch.einsum("bnqhd,bkhd->bnqhk", query, key)
+        scores = torch.einsum("bnhd,bkhd->bnhk", query, key)
         scores = scores / math.sqrt(self.head_dim)
 
-        # Relative text-variable attention over reports in the same grid.
-        # A single valid report receives weight 1; multiple reports compete
-        # along the report dimension. Empty grids are explicitly returned to
-        # zero after softmax so padded reports never contribute.
-        valid = membership.permute(0, 2, 1).view(b, 1, q, 1, k)
-        attention = torch.softmax(
-            scores.float().masked_fill(~valid, -1e4),
-            dim=-1,
-        )
-        attention = attention * valid.float()
-        attention = attention / attention.sum(
-            dim=-1,
-            keepdim=True,
-        ).clamp_min(1e-8)
+        # Softmax is over variables, not reports. Therefore one report still
+        # receives C distinct allocation weights instead of weight 1 for every
+        # variable. Padded reports are removed after normalization.
+        attention = torch.softmax(scores.float(), dim=1)
+        attention = attention * note_mask.view(b, 1, 1, k).float()
         context = torch.einsum(
-            "bnqhk,bkhd->bnqhd",
+            "bnhk,bqk,bkhd->bnqhd",
             attention.to(value.dtype),
+            time_weight.to(value.dtype),
             value,
         )
-        grid_note_count = membership.sum(dim=1)
+        note_count = note_mask.sum(dim=1)
+        context = context / note_count.clamp_min(1).view(
+            b, 1, 1, 1, 1
+        ).to(context.dtype)
         context = context.reshape(b, n, q, self.hidden)
 
         # Direct feature fusion: no learned post-context gate and no warmup.
         update_grid = self.context_out(context)
+        patient_has_text = note_mask.any(dim=1)
+        grid_has_text = patient_has_text.view(b, 1).expand(b, q)
         update_grid = update_grid * grid_has_text.view(b, 1, q, 1).to(
             update_grid.dtype
         )
         update = F.pad(update_grid.permute(0, 3, 1, 2), (1, 0, 0, 0))
 
         with torch.no_grad():
-            attention_mean = attention.mean(dim=3)
+            attention_mean = attention.mean(dim=2)  # (B, N, K)
+            attention_grid = attention_mean.unsqueeze(2).expand(b, n, q, k)
+            membership = note_mask.view(b, k, 1).expand(b, k, q)
             valid_query = grid_has_text.view(b, 1, q).expand(b, n, q)
-            multi_note_query = (grid_note_count > 1).view(b, 1, q).expand(
-                b, n, q
-            )
-            if multi_note_query.any():
+            if note_mask.any():
                 entropy = -(
                     attention_mean.clamp_min(1e-8).log() * attention_mean
-                ).sum(dim=-1)
-                entropy_scale = grid_note_count.clamp_min(2).log().view(
-                    b, 1, q
-                )
-                normalized_entropy = entropy / entropy_scale
-                attention_entropy = normalized_entropy[multi_note_query].mean()
-                attention_max = attention_mean.max(dim=-1).values[
-                    multi_note_query
+                ).sum(dim=1) / math.log(self.num_nodes)
+                attention_entropy = entropy[note_mask].mean()
+                attention_max = attention_mean.max(dim=1).values[
+                    note_mask
                 ].mean()
+                variable_usage = (
+                    attention_mean * note_mask.view(b, 1, k)
+                ).sum(dim=(0, 2)) / note_mask.sum().to(attention_mean.dtype)
+                uniform = torch.full_like(
+                    variable_usage, 1.0 / self.num_nodes
+                )
+                variable_imbalance = self.num_nodes * (
+                    variable_usage - uniform
+                ).square().sum()
+                time_valid = note_mask.view(b, 1, k).expand(b, q, k)
+                time_weight_mean = time_weight[time_valid].mean()
+                time_weight_max = time_weight[time_valid].max()
             else:
                 attention_entropy = None
                 attention_max = None
-            if grid_has_text.any():
-                multi_note_fraction = (grid_note_count[grid_has_text] > 1).to(
-                    torch.float32
-                ).mean()
-            else:
-                multi_note_fraction = context.new_zeros(())
+                variable_imbalance = None
+                time_weight_mean = None
+                time_weight_max = None
+            multi_note_fraction = (note_count[patient_has_text] > 1).to(
+                torch.float32
+            ).mean()
             if valid_query.any():
                 context_rms = context[valid_query].square().mean().sqrt()
                 update_abs_mean = update_grid[valid_query].abs().mean()
             else:
                 context_rms = context.new_zeros(())
                 update_abs_mean = context.new_zeros(())
-            # Keep last_relevance as a compatibility alias for existing
-            # evaluation code. These values are now softmax attention weights.
-            self.last_attention = attention_mean.detach()
+            # Keep the grid expansion for compatibility with per-variable
+            # evaluation. Semantic allocation is constant over grid time; the
+            # separate Gaussian supplies the temporal weight.
+            self.last_attention = attention_grid.detach()
             self.last_relevance = self.last_attention
             self.last_membership = membership.detach()
             self.last_attention_entropy = (
@@ -444,11 +436,30 @@ class HistoricalGridTextFusion(nn.Module):
                 if torch.is_tensor(attention_max)
                 else None
             )
-            self.last_multi_note_grid_fraction = multi_note_fraction.detach()
+            self.last_variable_attention_imbalance = (
+                variable_imbalance.detach()
+                if torch.is_tensor(variable_imbalance)
+                else None
+            )
+            self.last_multi_note_patient_fraction = multi_note_fraction.detach()
+            self.last_time_weight_mean = (
+                time_weight_mean.detach()
+                if torch.is_tensor(time_weight_mean)
+                else None
+            )
+            self.last_time_weight_max = (
+                time_weight_max.detach()
+                if torch.is_tensor(time_weight_max)
+                else None
+            )
             self.last_context_rms = context_rms.detach()
             self.last_grid_has_text = grid_has_text.detach()
-            self.last_grid_note_count = grid_note_count.detach()
-            self.last_note_grid_index = grid_index.masked_fill(~note_mask, -1).detach()
+            self.last_grid_note_count = note_count.view(b, 1).expand(b, q).detach()
+            self.last_note_count = note_count.detach()
+            nearest_grid = time_delta.abs().argmin(dim=1)
+            self.last_note_grid_index = nearest_grid.masked_fill(
+                ~note_mask, -1
+            ).detach()
             self.last_update_abs_mean = update_abs_mean.detach()
 
         return numeric_features + update
@@ -568,7 +579,7 @@ class LearnableTE(nn.Module):
 
 
 class GPINet(nn.Module):
-    """GP -> GH -> optional grid-aligned text -> MTGNN -> query decoder."""
+    """GP -> GH -> optional semantic-time text -> MTGNN -> query decoder."""
 
     def __init__(self, args, supports=None, dropout=0):
         super().__init__()
@@ -646,6 +657,9 @@ class GPINet(nn.Module):
                     total_window=float(args.history + args.pred_window),
                     n_heads=int(getattr(args, "n_heads_fusion", 1)),
                     dropout=float(args.dropout),
+                    time_sigma_hours=float(
+                        getattr(args, "gpinet_text_time_sigma_hours", 4.0)
+                    ),
                 )
         # populated on each forecasting() call for optional external logging
         self.last_mll = None

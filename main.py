@@ -718,7 +718,16 @@ def get_args_from_parser() -> argparse.Namespace:
         default=24,
         help=(
             "Number of historical GP grid points used by GPINet. Native "
-            "text reports are aligned to this same grid."
+            "text reports are diffused over this same grid by time distance."
+        ),
+    )
+    parser.add_argument(
+        "--gpinet_text_time_sigma_hours",
+        type=float,
+        default=4.0,
+        help=(
+            "Gaussian time-distance bandwidth in hours for spreading each "
+            "historical report over the GPINet history grid"
         ),
     )
     parser.add_argument(
@@ -844,6 +853,8 @@ def get_args_from_parser() -> argparse.Namespace:
         parser.error("--fusion_lr_multiplier must be > 0")
     if args.gpinet_query_points < 2:
         parser.error("--gpinet_query_points must be >= 2")
+    if args.gpinet_text_time_sigma_hours <= 0:
+        parser.error("--gpinet_text_time_sigma_hours must be > 0")
     if (
         args.enable_text
         and args.TTF_module == "TTF_SemTime_Slots"
@@ -1120,8 +1131,9 @@ def trainable(
     model = model_class(args).to(args.device)
 
     # GPINet with pre-computed embeddings owns its text path: reports are
-    # aligned to the historical GP grid and fused before MTGNN. Other models
-    # (and raw-text GPINet runs) keep the benchmark's external FusionModel.
+    # allocated over variables, diffused over the historical grid by time
+    # distance, and fused before MTGNN. Other models (and raw-text GPINet
+    # runs) keep the benchmark's external FusionModel.
     native_text_fusion = bool(
         args.enable_text and getattr(model, "native_text_enabled", False)
     )
@@ -1157,7 +1169,7 @@ def trainable(
     logger.info(args)
     if native_text_fusion:
         logger.info(
-            "Text route: GPINet native historical-grid fusion before MTGNN"
+            "Text route: GPINet variable allocation + Gaussian time diffusion"
         )
     elif fusion is not None:
         logger.info("Text route: external TTF/MMF prediction fusion")
@@ -1419,14 +1431,24 @@ def trainable(
                     val_res["mae"],
                 )
             )
-            if native_text_fusion and "text_relevance_mean" in val_res:
+            if (
+                native_text_fusion
+                and "text_variable_allocation_mean" in val_res
+            ):
                 logger.info(
-                    "Val - Text attention weight, multi-note entropy, "
+                    "Val - Variable attention entropy/max, time weight, "
                     "context RMS, update abs: {:.5f}, {:.5f}, {:.5f}, "
-                    "{:.5f}".format(
-                        val_res["text_relevance_mean"],
+                    "{:.5f}, {:.5f}".format(
                         val_res.get(
-                            "gpinet_text_attention_entropy",
+                            "gpinet_text_variable_attention_entropy",
+                            float("nan"),
+                        ),
+                        val_res.get(
+                            "gpinet_text_variable_attention_max",
+                            float("nan"),
+                        ),
+                        val_res.get(
+                            "gpinet_text_time_weight_mean",
                             float("nan"),
                         ),
                         val_res.get("gpinet_text_context_rms", float("nan")),
