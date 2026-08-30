@@ -167,9 +167,10 @@ class HistoricalGridTextFusion(nn.Module):
 
     Each valid report is assigned to exactly one grid point: the first query
     time that is not earlier than the report. A query built from the local
-    Gauss-Hermite feature, variable identity, and grid time then attends only
-    to reports assigned to that point. The resulting gated residual has the
-    same shape as the numeric feature map consumed by MTGNN.
+    Gauss-Hermite feature, variable identity, and grid time assigns an
+    independent sigmoid relevance to every report in that grid. The resulting
+    relevance-weighted text feature is added directly to the numeric feature
+    map consumed by MTGNN; there is no post-attention fusion gate.
     """
 
     def __init__(
@@ -182,9 +183,6 @@ class HistoricalGridTextFusion(nn.Module):
         total_window,
         n_heads=1,
         dropout=0.1,
-        gate_bias=-1.0,
-        warmup_epochs=0,
-        warmup_value=0.5,
     ):
         super().__init__()
         if n_heads < 1:
@@ -198,8 +196,6 @@ class HistoricalGridTextFusion(nn.Module):
             raise ValueError("history and history + pred_window must be positive")
         if history_window > total_window:
             raise ValueError("history cannot exceed history + pred_window")
-        if not 0.0 < warmup_value <= 1.0:
-            raise ValueError("warmup_value must be in (0, 1]")
 
         self.hidden = int(hidden)
         self.num_nodes = int(num_nodes)
@@ -207,9 +203,6 @@ class HistoricalGridTextFusion(nn.Module):
         self.head_dim = self.hidden // self.n_heads
         self.total_window = float(total_window)
         self.history_end = float(history_window) / self.total_window
-        self.warmup_epochs = max(0, int(warmup_epochs))
-        self.warmup_value = float(warmup_value)
-        self.current_epoch = 0
         self.register_buffer("t_query", t_query.detach().float().clone())
 
         self.content_proj = nn.Sequential(
@@ -229,40 +222,37 @@ class HistoricalGridTextFusion(nn.Module):
         self.key_proj = nn.Linear(self.hidden, self.hidden)
         self.value_proj = nn.Linear(self.hidden, self.hidden)
         self.query_proj = nn.Linear(self.hidden, self.hidden)
-        self.context_proj = nn.Sequential(
-            nn.Linear(self.hidden, self.hidden),
-            nn.GELU(),
-            nn.Linear(self.hidden, self.hidden),
-        )
-        self.gate = nn.Linear(2 * self.hidden, self.hidden)
-        nn.init.constant_(self.gate.bias, float(gate_bias))
+        # Bias-free output projection preserves the exact zero update for an
+        # empty grid or for reports whose learned relevance approaches zero.
+        self.context_out = nn.Linear(self.hidden, self.hidden, bias=False)
         self.dropout = nn.Dropout(float(dropout))
 
         # Detached diagnostics from the most recent forward pass.
+        self.last_relevance = None
+        self.last_membership = None
         self.last_attention = None
-        self.last_attention_entropy = None
         self.last_context_rms = None
-        self.last_gate = None
         self.last_grid_has_text = None
         self.last_grid_note_count = None
         self.last_note_grid_index = None
         self.last_update_abs_mean = None
-        self.last_gate_warmup_active = False
-
-    def set_training_epoch(self, epoch):
-        self.current_epoch = max(0, int(epoch))
 
     def _empty_update(self, numeric_features, batch_size, num_notes=0):
         q = self.t_query.numel()
         update = torch.zeros_like(numeric_features)
-        self.last_attention = numeric_features.new_zeros(
+        relevance = numeric_features.new_zeros(
             (batch_size, self.num_nodes, q, num_notes)
         )
-        self.last_attention_entropy = None
-        self.last_context_rms = None
-        self.last_gate = numeric_features.new_zeros(
-            (batch_size, self.num_nodes, q)
+        self.last_relevance = relevance
+        self.last_attention = relevance
+        self.last_membership = torch.zeros(
+            batch_size,
+            num_notes,
+            q,
+            dtype=torch.bool,
+            device=numeric_features.device,
         )
+        self.last_context_rms = None
         self.last_grid_has_text = torch.zeros(
             batch_size, q, dtype=torch.bool, device=numeric_features.device
         )
@@ -274,7 +264,6 @@ class HistoricalGridTextFusion(nn.Module):
             device=numeric_features.device,
         )
         self.last_update_abs_mean = None
-        self.last_gate_warmup_active = False
         return update
 
     def forward(self, numeric_features, notes_input, tau_raw):
@@ -372,58 +361,47 @@ class HistoricalGridTextFusion(nn.Module):
         scores = torch.einsum("bnqhd,bkhd->bnqhk", query, key)
         scores = scores / math.sqrt(self.head_dim)
 
+        # Independent text-variable relevance. Unlike softmax over reports,
+        # this remains meaningful when a grid contains exactly one report and
+        # allows all reports to be irrelevant to a particular variable.
         valid = membership.permute(0, 2, 1).view(b, 1, q, 1, k)
-        attention_prob = torch.softmax(
-            scores.float().masked_fill(~valid, -1e4),
-            dim=-1,
+        relevance = torch.sigmoid(scores.float()) * valid.float()
+        context = torch.einsum(
+            "bnqhk,bkhd->bnqhd",
+            relevance.to(value.dtype),
+            value,
         )
-        attention_prob = attention_prob * valid.float()
-        attention_prob = attention_prob / attention_prob.sum(
-            dim=-1,
-            keepdim=True,
-        ).clamp_min(1e-8)
-        attention = self.dropout(attention_prob).to(value.dtype)
-        context = torch.einsum("bnqhk,bkhd->bnqhd", attention, value)
+        grid_note_count = membership.sum(dim=1)
+        normalizer = grid_note_count.clamp_min(1).to(context.dtype)
+        context = context / normalizer.view(b, 1, q, 1, 1)
         context = context.reshape(b, n, q, self.hidden)
 
-        gate = torch.sigmoid(self.gate(torch.cat([query_token, context], dim=-1)))
-        warmup_active = self.training and self.current_epoch < self.warmup_epochs
-        if warmup_active:
-            gate = torch.full_like(gate, self.warmup_value)
-        gate = gate * grid_has_text.view(b, 1, q, 1).to(gate.dtype)
-        update_grid = gate * self.context_proj(context)
+        # Direct feature fusion: no learned post-context gate and no warmup.
+        update_grid = self.context_out(context)
+        update_grid = update_grid * grid_has_text.view(b, 1, q, 1).to(
+            update_grid.dtype
+        )
         update = F.pad(update_grid.permute(0, 3, 1, 2), (1, 0, 0, 0))
 
         with torch.no_grad():
-            attention_mean = attention_prob.mean(dim=3)
-            entropy = -(
-                attention_mean.clamp_min(1e-8).log() * attention_mean
-            ).sum(-1)
+            relevance_mean = relevance.mean(dim=3)
             valid_query = grid_has_text.view(b, 1, q).expand(b, n, q)
-            note_count = membership.sum(dim=1)
-            multiple_notes = (note_count > 1).view(b, 1, q).expand(b, n, q)
-            if multiple_notes.any():
-                entropy_scale = note_count.clamp_min(2).log().view(b, 1, q)
-                entropy = (entropy / entropy_scale)[multiple_notes].mean()
-            else:
-                entropy = None
             if valid_query.any():
                 context_rms = context[valid_query].square().mean().sqrt()
                 update_abs_mean = update_grid[valid_query].abs().mean()
             else:
                 context_rms = context.new_zeros(())
                 update_abs_mean = context.new_zeros(())
-            self.last_attention = attention_mean.detach()
-            self.last_attention_entropy = (
-                entropy.detach() if torch.is_tensor(entropy) else None
-            )
+            self.last_relevance = relevance_mean.detach()
+            # Compatibility alias for existing inspection code. These values
+            # are independent sigmoid relevances, not a probability simplex.
+            self.last_attention = self.last_relevance
+            self.last_membership = membership.detach()
             self.last_context_rms = context_rms.detach()
-            self.last_gate = gate.mean(dim=-1).detach()
             self.last_grid_has_text = grid_has_text.detach()
-            self.last_grid_note_count = membership.sum(dim=1).detach()
+            self.last_grid_note_count = grid_note_count.detach()
             self.last_note_grid_index = grid_index.masked_fill(~note_mask, -1).detach()
             self.last_update_abs_mean = update_abs_mean.detach()
-            self.last_gate_warmup_active = warmup_active
 
         return numeric_features + update
 
@@ -620,13 +598,6 @@ class GPINet(nn.Module):
                     total_window=float(args.history + args.pred_window),
                     n_heads=int(getattr(args, "n_heads_fusion", 1)),
                     dropout=float(args.dropout),
-                    gate_bias=float(getattr(args, "gpinet_text_gate_bias", -1.0)),
-                    warmup_epochs=int(
-                        getattr(args, "fusion_gate_warmup_epochs", 0)
-                    ),
-                    warmup_value=float(
-                        getattr(args, "fusion_gate_warmup_value", 0.5)
-                    ),
                 )
         # populated on each forecasting() call for optional external logging
         self.last_mll = None
@@ -634,10 +605,6 @@ class GPINet(nn.Module):
 
     def get_hyperparams(self):
         return self.gp.get_hyperparams()
-
-    def set_training_epoch(self, epoch):
-        if self.text_grid_fusion is not None:
-            self.text_grid_fusion.set_training_epoch(epoch)
 
     def forecasting(
         self,

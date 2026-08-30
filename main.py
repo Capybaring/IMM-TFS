@@ -722,15 +722,6 @@ def get_args_from_parser() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--gpinet_text_gate_bias",
-        type=float,
-        default=-1.0,
-        help=(
-            "Initial bias of GPINet's internal variable-text gate. "
-            "The default starts with a conservative but trainable text update."
-        ),
-    )
-    parser.add_argument(
         "--mmf_slot_attn_dim",
         type=int,
         default=128,
@@ -1222,7 +1213,7 @@ def trainable(
             return
         if native_text_fusion:
             text_module = model.text_grid_fusion
-            delta_out = text_module.context_proj[-1]
+            delta_out = text_module.context_out
             prefix = "GPINetTextBootstrap"
         else:
             mmf = getattr(fusion, "mmf", None)
@@ -1283,22 +1274,13 @@ def trainable(
     for itr in range(args.epoch):
         st = time.time()
 
-        model_epoch_setter = getattr(model, "set_training_epoch", None)
-        if callable(model_epoch_setter):
-            model_epoch_setter(itr)
         if fusion is not None:
             fusion.set_training_epoch(itr)
-        if native_text_fusion:
-            gate_warmup_epochs = int(
-                getattr(model.text_grid_fusion, "warmup_epochs", 0)
-            )
-        else:
-            gate_warmup_epochs = int(
-                getattr(getattr(fusion, "mmf", None), "gate_warmup_epochs", 0)
-            )
+        gate_warmup_epochs = int(
+            getattr(getattr(fusion, "mmf", None), "gate_warmup_epochs", 0)
+        )
         gate_warmup_active = (
-            (native_text_fusion or fusion is not None)
-            and itr < gate_warmup_epochs
+            fusion is not None and itr < gate_warmup_epochs
         )
 
         ### Training ###
@@ -1437,7 +1419,19 @@ def trainable(
                     val_res["mae"],
                 )
             )
-            if "text_gate_mean" in val_res:
+            if native_text_fusion and "text_relevance_mean" in val_res:
+                logger.info(
+                    "Val - Text relevance, context RMS, update abs: "
+                    "{:.5f}, {:.5f}, {:.5f}".format(
+                        val_res["text_relevance_mean"],
+                        val_res.get("gpinet_text_context_rms", float("nan")),
+                        val_res.get(
+                            "gpinet_text_update_abs_mean",
+                            float("nan"),
+                        ),
+                    )
+                )
+            elif "text_gate_mean" in val_res:
                 logger.info(
                     "Val - Text gate mean, attention entropy: {:.5f}, {:.5f}".format(
                         val_res["text_gate_mean"],

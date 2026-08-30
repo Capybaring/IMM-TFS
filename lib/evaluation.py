@@ -470,7 +470,7 @@ def evaluation(
     has_relevance_diag = False
     has_gate_diag = False
     has_null_probability_diag = False
-    native_gate_count = None
+    native_relevance_count = None
     diag_sum = {}
     diag_count = {}
 
@@ -542,7 +542,7 @@ def evaluation(
                 relevance_sum = torch.zeros_like(base_se)
                 gate_sum = torch.zeros_like(base_se)
                 null_probability_sum = torch.zeros_like(base_se)
-                native_gate_count = torch.zeros_like(base_se)
+                native_relevance_count = torch.zeros_like(base_se)
             base_se_sum += base_se
             base_ae_sum += base_ae
 
@@ -553,7 +553,8 @@ def evaluation(
             mmf = getattr(fusion, "mmf", None) if fusion is not None else None
             if native_text:
                 text_module = getattr(model, "text_grid_fusion", None)
-                gate_value = getattr(text_module, "last_gate", None)
+                relevance = getattr(text_module, "last_relevance", None)
+                membership = getattr(text_module, "last_membership", None)
                 grid_has_text = getattr(
                     text_module,
                     "last_grid_has_text",
@@ -564,18 +565,18 @@ def evaluation(
                     "last_grid_note_count",
                     None,
                 )
-                if torch.is_tensor(gate_value) and torch.is_tensor(grid_has_text):
-                    valid_grid = grid_has_text[:, None, :].expand_as(gate_value)
-                    gate_sum += (gate_value * valid_grid).sum(dim=(0, 2))
-                    native_gate_count += valid_grid.sum(dim=(0, 2))
-                    has_gate_diag = True
+                if torch.is_tensor(relevance) and torch.is_tensor(membership):
+                    valid_relevance = membership.permute(0, 2, 1)[:, None]
+                    valid_relevance = valid_relevance.expand_as(relevance)
+                    if valid_relevance.any():
+                        relevance_sum += (
+                            relevance * valid_relevance
+                        ).sum(dim=(0, 2, 3))
+                        native_relevance_count += valid_relevance.sum(
+                            dim=(0, 2, 3)
+                        )
+                        has_relevance_diag = True
                 if torch.is_tensor(grid_has_text) and grid_has_text.any():
-                    _add_diag(
-                        diag_sum,
-                        diag_count,
-                        "text_attention_entropy",
-                        getattr(text_module, "last_attention_entropy", None),
-                    )
                     _add_diag(
                         diag_sum,
                         diag_count,
@@ -713,18 +714,20 @@ def evaluation(
         # These diagnostics are architecture-specific.  Do not emit a dict of
         # fake zeros when the selected paper MMF does not implement the field.
         if has_relevance_diag:
-            relevance_var = relevance_sum / mask_count.clamp_min(1e-8)
+            relevance_denominator = (
+                native_relevance_count
+                if native_relevance_count is not None
+                and native_relevance_count.sum() > 0
+                else mask_count
+            )
+            relevance_var = relevance_sum / relevance_denominator.clamp_min(1e-8)
             results["text_relevance_per_variable"] = _to_named_dict(
                 names,
                 relevance_var,
             )
+            results["text_relevance_mean"] = relevance_var.mean().item()
         if has_gate_diag:
-            gate_denominator = (
-                native_gate_count
-                if native_gate_count is not None and native_gate_count.sum() > 0
-                else mask_count
-            )
-            gate_var = gate_sum / gate_denominator.clamp_min(1e-8)
+            gate_var = gate_sum / mask_count.clamp_min(1e-8)
             results["text_gate_per_variable"] = _to_named_dict(
                 names,
                 gate_var,

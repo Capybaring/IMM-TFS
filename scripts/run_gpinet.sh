@@ -19,9 +19,6 @@ OUTPUT_DIR="logs/gpinet_runs"
 GP_QUERY_POINTS=24
 TEXT_HEADS=1
 TEXT_DIM=768
-GPINET_TEXT_GATE_BIAS=-1.0
-FUSION_GATE_WARMUP_EPOCHS=5
-FUSION_GATE_WARMUP_VALUE=0.5
 FUSION_LR_MULTIPLIER=2.0
 
 usage() {
@@ -139,9 +136,6 @@ if [[ "$MODE" == "multi" ]]; then
         --max_length 512
         --n_heads_fusion "$TEXT_HEADS"
         --d_txt "$TEXT_DIM"
-        --gpinet_text_gate_bias "$GPINET_TEXT_GATE_BIAS"
-        --fusion_gate_warmup_epochs "$FUSION_GATE_WARMUP_EPOCHS"
-        --fusion_gate_warmup_value "$FUSION_GATE_WARMUP_VALUE"
         --fusion_lr_multiplier "$FUSION_LR_MULTIPLIER"
     )
 fi
