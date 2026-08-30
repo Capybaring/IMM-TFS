@@ -167,10 +167,10 @@ class HistoricalGridTextFusion(nn.Module):
 
     Each valid report is assigned to exactly one grid point: the first query
     time that is not earlier than the report. A query built from the local
-    Gauss-Hermite feature, variable identity, and grid time assigns an
-    independent sigmoid relevance to every report in that grid. The resulting
-    relevance-weighted text feature is added directly to the numeric feature
-    map consumed by MTGNN; there is no post-attention fusion gate.
+    Gauss-Hermite feature, variable identity, and grid time attends over the
+    reports assigned to that grid with masked softmax. The resulting weighted
+    text feature is added directly to the numeric feature map consumed by
+    MTGNN; there is no post-attention fusion gate.
     """
 
     def __init__(
@@ -223,7 +223,7 @@ class HistoricalGridTextFusion(nn.Module):
         self.value_proj = nn.Linear(self.hidden, self.hidden)
         self.query_proj = nn.Linear(self.hidden, self.hidden)
         # Bias-free output projection preserves the exact zero update for an
-        # empty grid or for reports whose learned relevance approaches zero.
+        # empty grid.
         self.context_out = nn.Linear(self.hidden, self.hidden, bias=False)
         self.dropout = nn.Dropout(float(dropout))
 
@@ -231,6 +231,9 @@ class HistoricalGridTextFusion(nn.Module):
         self.last_relevance = None
         self.last_membership = None
         self.last_attention = None
+        self.last_attention_entropy = None
+        self.last_attention_max = None
+        self.last_multi_note_grid_fraction = None
         self.last_context_rms = None
         self.last_grid_has_text = None
         self.last_grid_note_count = None
@@ -245,6 +248,9 @@ class HistoricalGridTextFusion(nn.Module):
         )
         self.last_relevance = relevance
         self.last_attention = relevance
+        self.last_attention_entropy = None
+        self.last_attention_max = None
+        self.last_multi_note_grid_fraction = None
         self.last_membership = torch.zeros(
             batch_size,
             num_notes,
@@ -361,19 +367,26 @@ class HistoricalGridTextFusion(nn.Module):
         scores = torch.einsum("bnqhd,bkhd->bnqhk", query, key)
         scores = scores / math.sqrt(self.head_dim)
 
-        # Independent text-variable relevance. Unlike softmax over reports,
-        # this remains meaningful when a grid contains exactly one report and
-        # allows all reports to be irrelevant to a particular variable.
+        # Relative text-variable attention over reports in the same grid.
+        # A single valid report receives weight 1; multiple reports compete
+        # along the report dimension. Empty grids are explicitly returned to
+        # zero after softmax so padded reports never contribute.
         valid = membership.permute(0, 2, 1).view(b, 1, q, 1, k)
-        relevance = torch.sigmoid(scores.float()) * valid.float()
+        attention = torch.softmax(
+            scores.float().masked_fill(~valid, -1e4),
+            dim=-1,
+        )
+        attention = attention * valid.float()
+        attention = attention / attention.sum(
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(1e-8)
         context = torch.einsum(
             "bnqhk,bkhd->bnqhd",
-            relevance.to(value.dtype),
+            attention.to(value.dtype),
             value,
         )
         grid_note_count = membership.sum(dim=1)
-        normalizer = grid_note_count.clamp_min(1).to(context.dtype)
-        context = context / normalizer.view(b, 1, q, 1, 1)
         context = context.reshape(b, n, q, self.hidden)
 
         # Direct feature fusion: no learned post-context gate and no warmup.
@@ -384,19 +397,54 @@ class HistoricalGridTextFusion(nn.Module):
         update = F.pad(update_grid.permute(0, 3, 1, 2), (1, 0, 0, 0))
 
         with torch.no_grad():
-            relevance_mean = relevance.mean(dim=3)
+            attention_mean = attention.mean(dim=3)
             valid_query = grid_has_text.view(b, 1, q).expand(b, n, q)
+            multi_note_query = (grid_note_count > 1).view(b, 1, q).expand(
+                b, n, q
+            )
+            if multi_note_query.any():
+                entropy = -(
+                    attention_mean.clamp_min(1e-8).log() * attention_mean
+                ).sum(dim=-1)
+                entropy_scale = grid_note_count.clamp_min(2).log().view(
+                    b, 1, q
+                )
+                normalized_entropy = entropy / entropy_scale
+                attention_entropy = normalized_entropy[multi_note_query].mean()
+                attention_max = attention_mean.max(dim=-1).values[
+                    multi_note_query
+                ].mean()
+            else:
+                attention_entropy = None
+                attention_max = None
+            if grid_has_text.any():
+                multi_note_fraction = (grid_note_count[grid_has_text] > 1).to(
+                    torch.float32
+                ).mean()
+            else:
+                multi_note_fraction = context.new_zeros(())
             if valid_query.any():
                 context_rms = context[valid_query].square().mean().sqrt()
                 update_abs_mean = update_grid[valid_query].abs().mean()
             else:
                 context_rms = context.new_zeros(())
                 update_abs_mean = context.new_zeros(())
-            self.last_relevance = relevance_mean.detach()
-            # Compatibility alias for existing inspection code. These values
-            # are independent sigmoid relevances, not a probability simplex.
-            self.last_attention = self.last_relevance
+            # Keep last_relevance as a compatibility alias for existing
+            # evaluation code. These values are now softmax attention weights.
+            self.last_attention = attention_mean.detach()
+            self.last_relevance = self.last_attention
             self.last_membership = membership.detach()
+            self.last_attention_entropy = (
+                attention_entropy.detach()
+                if torch.is_tensor(attention_entropy)
+                else None
+            )
+            self.last_attention_max = (
+                attention_max.detach()
+                if torch.is_tensor(attention_max)
+                else None
+            )
+            self.last_multi_note_grid_fraction = multi_note_fraction.detach()
             self.last_context_rms = context_rms.detach()
             self.last_grid_has_text = grid_has_text.detach()
             self.last_grid_note_count = grid_note_count.detach()

@@ -1421,9 +1421,14 @@ def trainable(
             )
             if native_text_fusion and "text_relevance_mean" in val_res:
                 logger.info(
-                    "Val - Text relevance, context RMS, update abs: "
-                    "{:.5f}, {:.5f}, {:.5f}".format(
+                    "Val - Text attention weight, multi-note entropy, "
+                    "context RMS, update abs: {:.5f}, {:.5f}, {:.5f}, "
+                    "{:.5f}".format(
                         val_res["text_relevance_mean"],
+                        val_res.get(
+                            "gpinet_text_attention_entropy",
+                            float("nan"),
+                        ),
                         val_res.get("gpinet_text_context_rms", float("nan")),
                         val_res.get(
                             "gpinet_text_update_abs_mean",

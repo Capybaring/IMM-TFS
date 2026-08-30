@@ -580,6 +580,28 @@ def evaluation(
                     _add_diag(
                         diag_sum,
                         diag_count,
+                        "gpinet_text_attention_entropy",
+                        getattr(text_module, "last_attention_entropy", None),
+                    )
+                    _add_diag(
+                        diag_sum,
+                        diag_count,
+                        "gpinet_text_attention_max",
+                        getattr(text_module, "last_attention_max", None),
+                    )
+                    _add_diag(
+                        diag_sum,
+                        diag_count,
+                        "gpinet_text_multi_note_grid_fraction",
+                        getattr(
+                            text_module,
+                            "last_multi_note_grid_fraction",
+                            None,
+                        ),
+                    )
+                    _add_diag(
+                        diag_sum,
+                        diag_count,
                         "gpinet_text_context_rms",
                         getattr(text_module, "last_context_rms", None),
                     )
