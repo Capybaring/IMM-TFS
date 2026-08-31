@@ -85,8 +85,7 @@ def compute_all_losses(
             )
         forecast_kwargs = {
             "notes_input": batch_dict["notes_embeddings"],
-            # Native GPINet performs its own normalization against the full
-            # history + prediction window, so it must receive raw timestamps.
+            # Gaussian alignment is parameterized directly in dataset hours.
             "tau": batch_dict["tau_raw"],
         }
     pred_y = model.forecasting(
@@ -578,24 +577,38 @@ def evaluation(
                     _add_diag(
                         diag_sum,
                         diag_count,
-                        "gpinet_text_cross_attention_entropy",
-                        getattr(text_module, "last_attention_entropy", None),
-                    )
-                    _add_diag(
-                        diag_sum,
-                        diag_count,
-                        "gpinet_text_cross_attention_max",
-                        getattr(text_module, "last_attention_max", None),
-                    )
-                    _add_diag(
-                        diag_sum,
-                        diag_count,
-                        "gpinet_text_cross_variable_diversity",
+                        "gpinet_text_gaussian_weight_mean",
                         getattr(
                             text_module,
-                            "last_cross_variable_diversity",
+                            "last_gaussian_weight_mean",
                             None,
                         ),
+                    )
+                    _add_diag(
+                        diag_sum,
+                        diag_count,
+                        "gpinet_text_gaussian_weight_max",
+                        getattr(
+                            text_module,
+                            "last_gaussian_weight_max",
+                            None,
+                        ),
+                    )
+                    _add_diag(
+                        diag_sum,
+                        diag_count,
+                        "gpinet_text_background_temporal_variation",
+                        getattr(
+                            text_module,
+                            "last_text_temporal_variation",
+                            None,
+                        ),
+                    )
+                    _add_diag(
+                        diag_sum,
+                        diag_count,
+                        "gpinet_text_background_rms",
+                        getattr(text_module, "last_background_rms", None),
                     )
                     _add_diag(
                         diag_sum,
@@ -606,44 +619,6 @@ def evaluation(
                             "last_multi_note_patient_fraction",
                             None,
                         ),
-                    )
-                    _add_diag(
-                        diag_sum,
-                        diag_count,
-                        "gpinet_text_time_attention_entropy",
-                        getattr(
-                            text_module,
-                            "last_time_attention_entropy",
-                            None,
-                        ),
-                    )
-                    _add_diag(
-                        diag_sum,
-                        diag_count,
-                        "gpinet_text_time_attention_max",
-                        getattr(text_module, "last_time_attention_max", None),
-                    )
-                    _add_diag(
-                        diag_sum,
-                        diag_count,
-                        "gpinet_text_temporal_variation",
-                        getattr(
-                            text_module,
-                            "last_text_temporal_variation",
-                            None,
-                        ),
-                    )
-                    _add_diag(
-                        diag_sum,
-                        diag_count,
-                        "gpinet_text_context_rms",
-                        getattr(text_module, "last_context_rms", None),
-                    )
-                    _add_diag(
-                        diag_sum,
-                        diag_count,
-                        "gpinet_text_update_abs_mean",
-                        getattr(text_module, "last_update_abs_mean", None),
                     )
                 _add_diag(
                     diag_sum,

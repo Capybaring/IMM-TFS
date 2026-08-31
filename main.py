@@ -711,8 +711,8 @@ def get_args_from_parser() -> argparse.Namespace:
         type=int,
         default=1,
         help=(
-            "Number of time-attention and cross-attention heads in GPINet "
-            "native text fusion (also used by external Fusion modules)"
+            "Number of attention heads used by external Fusion modules; "
+            "GPINet's Gaussian text-background route does not use attention"
         ),
     )
     parser.add_argument(
@@ -721,7 +721,16 @@ def get_args_from_parser() -> argparse.Namespace:
         default=24,
         help=(
             "Number of historical GP grid points used by GPINet. Native "
-            "mTAND text alignment uses this same reference grid."
+            "Gaussian text alignment uses this same reference grid."
+        ),
+    )
+    parser.add_argument(
+        "--gpinet_text_time_sigma_hours",
+        type=float,
+        default=3.0,
+        help=(
+            "Gaussian bandwidth in hours for mapping irregular reports to "
+            "the GPINet text-background node"
         ),
     )
     parser.add_argument(
@@ -847,6 +856,8 @@ def get_args_from_parser() -> argparse.Namespace:
         parser.error("--fusion_lr_multiplier must be > 0")
     if args.gpinet_query_points < 2:
         parser.error("--gpinet_query_points must be >= 2")
+    if args.gpinet_text_time_sigma_hours <= 0:
+        parser.error("--gpinet_text_time_sigma_hours must be > 0")
     if (
         args.enable_text
         and args.TTF_module == "TTF_SemTime_Slots"
@@ -1122,10 +1133,10 @@ def trainable(
     model_class = _load_model_class(args.model)
     model = model_class(args).to(args.device)
 
-    # GPINet with pre-computed embeddings owns its text path: mTAND aligns
-    # irregular reports to the historical grid and one residual cross-attention
-    # injects text before MTGNN. Other models (and raw-text GPINet runs) keep
-    # the benchmark's external FusionModel.
+    # GPINet with pre-computed embeddings owns its text path: a fixed Gaussian
+    # kernel maps irregular reports to one regular text-background node, which
+    # is appended to the numerical nodes before MTGNN. Other models (and
+    # raw-text GPINet runs) keep the benchmark's external FusionModel.
     native_text_fusion = bool(
         args.enable_text and getattr(model, "native_text_enabled", False)
     )
@@ -1161,7 +1172,7 @@ def trainable(
     logger.info(args)
     if native_text_fusion:
         logger.info(
-            "Text route: GPINet mTAND alignment + residual cross-attention"
+            "Text route: GPINet Gaussian alignment + MTGNN background node"
         )
     elif fusion is not None:
         logger.info("Text route: external TTF/MMF prediction fusion")
@@ -1217,8 +1228,8 @@ def trainable(
             return
         if native_text_fusion:
             text_module = model.text_grid_fusion
-            delta_out = text_module.context_out
-            prefix = "GPINetTextBootstrap"
+            delta_out = text_module.text_proj
+            prefix = "GPINetTextBackgroundBootstrap"
         else:
             mmf = getattr(fusion, "mmf", None)
             delta_out = getattr(mmf, "delta_out", None)
@@ -1425,37 +1436,23 @@ def trainable(
             )
             if native_text_fusion:
                 logger.info(
-                    "Val - Cross entropy/max/diversity, mTAND entropy/max, "
-                    "text temporal variation, context RMS, update abs: "
-                    "{:.5f}, {:.5f}, {:.5f}, {:.5f}, {:.5f}, {:.5f}, "
-                    "{:.5f}, {:.5f}".format(
+                    "Val - Gaussian weight mean/max, text temporal "
+                    "variation, background RMS: {:.5f}, {:.5f}, {:.5f}, "
+                    "{:.5f}".format(
                         val_res.get(
-                            "gpinet_text_cross_attention_entropy",
+                            "gpinet_text_gaussian_weight_mean",
                             float("nan"),
                         ),
                         val_res.get(
-                            "gpinet_text_cross_attention_max",
+                            "gpinet_text_gaussian_weight_max",
                             float("nan"),
                         ),
                         val_res.get(
-                            "gpinet_text_cross_variable_diversity",
+                            "gpinet_text_background_temporal_variation",
                             float("nan"),
                         ),
                         val_res.get(
-                            "gpinet_text_time_attention_entropy",
-                            float("nan"),
-                        ),
-                        val_res.get(
-                            "gpinet_text_time_attention_max",
-                            float("nan"),
-                        ),
-                        val_res.get(
-                            "gpinet_text_temporal_variation",
-                            float("nan"),
-                        ),
-                        val_res.get("gpinet_text_context_rms", float("nan")),
-                        val_res.get(
-                            "gpinet_text_update_abs_mean",
+                            "gpinet_text_background_rms",
                             float("nan"),
                         ),
                     )

@@ -17,9 +17,9 @@ USE_AMP=0
 OUTPUT_DIR="logs/gpinet_runs"
 
 GP_QUERY_POINTS=24
-TEXT_HEADS=8
 TEXT_DIM=768
-FUSION_LR_MULTIPLIER=2.0
+TEXT_TIME_SIGMA_HOURS=3.0
+FUSION_LR_MULTIPLIER=1.0
 
 usage() {
     cat <<'EOF'
@@ -134,8 +134,8 @@ if [[ "$MODE" == "multi" ]]; then
         --llm_model_fusion BERT
         --llm_layers_fusion 6
         --max_length 512
-        --n_heads_fusion "$TEXT_HEADS"
         --d_txt "$TEXT_DIM"
+        --gpinet_text_time_sigma_hours "$TEXT_TIME_SIGMA_HOURS"
         --fusion_lr_multiplier "$FUSION_LR_MULTIPLIER"
     )
 fi
