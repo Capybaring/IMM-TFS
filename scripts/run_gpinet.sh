@@ -17,9 +17,8 @@ USE_AMP=0
 OUTPUT_DIR="logs/gpinet_runs"
 
 GP_QUERY_POINTS=24
-TEXT_HEADS=1
+TEXT_HEADS=8
 TEXT_DIM=768
-TEXT_TIME_SIGMA_HOURS=4.0
 FUSION_LR_MULTIPLIER=2.0
 
 usage() {
@@ -137,7 +136,6 @@ if [[ "$MODE" == "multi" ]]; then
         --max_length 512
         --n_heads_fusion "$TEXT_HEADS"
         --d_txt "$TEXT_DIM"
-        --gpinet_text_time_sigma_hours "$TEXT_TIME_SIGMA_HOURS"
         --fusion_lr_multiplier "$FUSION_LR_MULTIPLIER"
     )
 fi

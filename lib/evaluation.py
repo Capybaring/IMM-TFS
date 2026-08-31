@@ -578,22 +578,22 @@ def evaluation(
                     _add_diag(
                         diag_sum,
                         diag_count,
-                        "gpinet_text_variable_attention_entropy",
+                        "gpinet_text_cross_attention_entropy",
                         getattr(text_module, "last_attention_entropy", None),
                     )
                     _add_diag(
                         diag_sum,
                         diag_count,
-                        "gpinet_text_variable_attention_max",
+                        "gpinet_text_cross_attention_max",
                         getattr(text_module, "last_attention_max", None),
                     )
                     _add_diag(
                         diag_sum,
                         diag_count,
-                        "gpinet_text_variable_attention_imbalance",
+                        "gpinet_text_cross_variable_diversity",
                         getattr(
                             text_module,
-                            "last_variable_attention_imbalance",
+                            "last_cross_variable_diversity",
                             None,
                         ),
                     )
@@ -610,14 +610,28 @@ def evaluation(
                     _add_diag(
                         diag_sum,
                         diag_count,
-                        "gpinet_text_time_weight_mean",
-                        getattr(text_module, "last_time_weight_mean", None),
+                        "gpinet_text_time_attention_entropy",
+                        getattr(
+                            text_module,
+                            "last_time_attention_entropy",
+                            None,
+                        ),
                     )
                     _add_diag(
                         diag_sum,
                         diag_count,
-                        "gpinet_text_time_weight_max",
-                        getattr(text_module, "last_time_weight_max", None),
+                        "gpinet_text_time_attention_max",
+                        getattr(text_module, "last_time_attention_max", None),
+                    )
+                    _add_diag(
+                        diag_sum,
+                        diag_count,
+                        "gpinet_text_temporal_variation",
+                        getattr(
+                            text_module,
+                            "last_text_temporal_variation",
+                            None,
+                        ),
                     )
                     _add_diag(
                         diag_sum,
