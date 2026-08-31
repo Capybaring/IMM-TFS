@@ -731,6 +731,23 @@ def get_args_from_parser() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--gpinet_text_fusion_mode",
+        type=str,
+        choices=("add", "cross"),
+        default="cross",
+        help=(
+            "Native GPINet text fusion: 'add' keeps the factorized direct-add "
+            "ablation; 'cross' lets each numeric grid state query reports "
+            "under the semantic-variable and Gaussian-time priors"
+        ),
+    )
+    parser.add_argument(
+        "--gpinet_text_cross_ffn_ratio",
+        type=float,
+        default=2.0,
+        help="Hidden expansion ratio of the GPINet cross-modal residual FFN",
+    )
+    parser.add_argument(
         "--mmf_slot_attn_dim",
         type=int,
         default=128,
@@ -855,6 +872,8 @@ def get_args_from_parser() -> argparse.Namespace:
         parser.error("--gpinet_query_points must be >= 2")
     if args.gpinet_text_time_sigma_hours <= 0:
         parser.error("--gpinet_text_time_sigma_hours must be > 0")
+    if args.gpinet_text_cross_ffn_ratio <= 0:
+        parser.error("--gpinet_text_cross_ffn_ratio must be > 0")
     if (
         args.enable_text
         and args.TTF_module == "TTF_SemTime_Slots"
@@ -1169,7 +1188,9 @@ def trainable(
     logger.info(args)
     if native_text_fusion:
         logger.info(
-            "Text route: GPINet variable allocation + Gaussian time diffusion"
+            "Text route: GPINet variable allocation + Gaussian time prior + "
+            "%s fusion",
+            args.gpinet_text_fusion_mode,
         )
     elif fusion is not None:
         logger.info("Text route: external TTF/MMF prediction fusion")
@@ -1436,15 +1457,24 @@ def trainable(
                 and "text_variable_allocation_mean" in val_res
             ):
                 logger.info(
-                    "Val - Variable attention entropy/max, time weight, "
-                    "context RMS, update abs: {:.5f}, {:.5f}, {:.5f}, "
-                    "{:.5f}, {:.5f}".format(
+                    "Val - Variable attention entropy/max, cross attention "
+                    "entropy/max, time weight, context RMS, update abs: "
+                    "{:.5f}, {:.5f}, {:.5f}, {:.5f}, {:.5f}, {:.5f}, "
+                    "{:.5f}".format(
                         val_res.get(
                             "gpinet_text_variable_attention_entropy",
                             float("nan"),
                         ),
                         val_res.get(
                             "gpinet_text_variable_attention_max",
+                            float("nan"),
+                        ),
+                        val_res.get(
+                            "gpinet_text_cross_attention_entropy",
+                            float("nan"),
+                        ),
+                        val_res.get(
+                            "gpinet_text_cross_attention_max",
                             float("nan"),
                         ),
                         val_res.get(
