@@ -590,26 +590,6 @@ def evaluation(
                     _add_diag(
                         diag_sum,
                         diag_count,
-                        "gpinet_text_cross_attention_entropy",
-                        getattr(
-                            text_module,
-                            "last_cross_attention_entropy",
-                            None,
-                        ),
-                    )
-                    _add_diag(
-                        diag_sum,
-                        diag_count,
-                        "gpinet_text_cross_attention_max",
-                        getattr(
-                            text_module,
-                            "last_cross_attention_max",
-                            None,
-                        ),
-                    )
-                    _add_diag(
-                        diag_sum,
-                        diag_count,
                         "gpinet_text_variable_attention_imbalance",
                         getattr(
                             text_module,
@@ -650,26 +630,6 @@ def evaluation(
                         diag_count,
                         "gpinet_text_update_abs_mean",
                         getattr(text_module, "last_update_abs_mean", None),
-                    )
-                    _add_diag(
-                        diag_sum,
-                        diag_count,
-                        "gpinet_text_interaction_abs_mean",
-                        getattr(
-                            text_module,
-                            "last_interaction_abs_mean",
-                            None,
-                        ),
-                    )
-                    _add_diag(
-                        diag_sum,
-                        diag_count,
-                        "gpinet_text_effective_grid_fraction",
-                        getattr(
-                            text_module,
-                            "last_effective_grid_fraction",
-                            None,
-                        ),
                     )
                 _add_diag(
                     diag_sum,

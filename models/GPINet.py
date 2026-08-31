@@ -10,8 +10,9 @@ the project root (models/gpinet_mm.py), this file:
     training loop and evaluation code as every other baseline.
   - optionally aligns pre-computed report embeddings to the historical GP
     grid and fuses them with Gauss-Hermite features *before* the MTGNN
-    temporal/graph blocks. A learned semantic-variable prior and an exact
-    timestamp Gaussian prior guide numeric-query/text-key cross-attention.
+    temporal/graph blocks. Reports are assigned to the first grid point at
+    or after their timestamp, so future text never leaks into an earlier
+    state and empty grid points receive an exactly-zero text update.
   - queries the decoder at the batch's actual `time_steps_to_predict`
     (variable, padded, continuous) instead of a fixed internal grid, since
     IMM-TSF's standard collate does not guarantee a fixed prediction length
@@ -146,15 +147,13 @@ class GaussHermiteFusionModule(nn.Module):
 
 
 class HistoricalGridTextFusion(nn.Module):
-    """Factor text influence, then condition it on the numeric grid state.
+    """Factor text influence into semantic-variable and temporal weights.
 
     Every report first distributes its semantic content over the variables by
     softmax across learned variable prototypes. Its original timestamp then
-    produces a Gaussian weight over every historical GP grid point. In
-    ``cross`` mode their product becomes a prior for cross-modal attention:
-    each Gauss-Hermite variable-time state queries the original report tokens.
-    A bias-free residual interaction block then updates the regular grid before
-    MTGNN. ``add`` mode retains the earlier factorized direct-add ablation.
+    produces a Gaussian weight over every historical GP grid point. The outer
+    product of these two weights creates a regular variable-time text feature
+    map that is added directly to the Gauss-Hermite feature before MTGNN.
     """
 
     def __init__(
@@ -168,8 +167,6 @@ class HistoricalGridTextFusion(nn.Module):
         n_heads=1,
         dropout=0.1,
         time_sigma_hours=4.0,
-        fusion_mode="cross",
-        cross_ffn_ratio=2.0,
     ):
         super().__init__()
         if n_heads < 1:
@@ -185,10 +182,6 @@ class HistoricalGridTextFusion(nn.Module):
             raise ValueError("history cannot exceed history + pred_window")
         if time_sigma_hours <= 0:
             raise ValueError("GPINet text time sigma must be positive")
-        if fusion_mode not in {"add", "cross"}:
-            raise ValueError("GPINet text fusion mode must be 'add' or 'cross'")
-        if cross_ffn_ratio <= 0:
-            raise ValueError("GPINet text cross FFN ratio must be positive")
 
         self.hidden = int(hidden)
         self.num_nodes = int(num_nodes)
@@ -197,7 +190,6 @@ class HistoricalGridTextFusion(nn.Module):
         self.total_window = float(total_window)
         self.history_end = float(history_window) / self.total_window
         self.time_sigma_hours = float(time_sigma_hours)
-        self.fusion_mode = str(fusion_mode)
         self.register_buffer("t_query", t_query.detach().float().clone())
 
         self.content_proj = nn.Sequential(
@@ -217,41 +209,17 @@ class HistoricalGridTextFusion(nn.Module):
         self.context_out = nn.Linear(self.hidden, self.hidden, bias=False)
         self.dropout = nn.Dropout(float(dropout))
 
-        # Numeric-conditioned cross-modal adapter.  The numeric grid is the
-        # query while the original report tokens remain keys/values.  The
-        # variable and Gaussian weights are injected as an attention prior,
-        # rather than being asked to replace content-dependent interaction.
-        self.numeric_norm = nn.LayerNorm(self.hidden)
-        self.numeric_query_proj = nn.Linear(self.hidden, self.hidden)
-        ffn_hidden = max(
-            self.hidden,
-            int(round(self.hidden * float(cross_ffn_ratio))),
-        )
-        self.cross_ffn = nn.Sequential(
-            nn.Linear(self.hidden * 2, ffn_hidden, bias=False),
-            nn.GELU(),
-            nn.Dropout(float(dropout)),
-            nn.Linear(ffn_hidden, self.hidden, bias=False),
-        )
-        # Start from the cross-attention residual itself; the nonlinear
-        # numeric-text interaction is introduced gradually during training.
-        nn.init.zeros_(self.cross_ffn[-1].weight)
-
         # Detached diagnostics from the most recent forward pass.
         self.last_relevance = None
         self.last_membership = None
         self.last_attention = None
         self.last_attention_entropy = None
         self.last_attention_max = None
-        self.last_cross_attention_entropy = None
-        self.last_cross_attention_max = None
         self.last_variable_attention_imbalance = None
         self.last_multi_note_patient_fraction = None
         self.last_time_weight_mean = None
         self.last_time_weight_max = None
-        self.last_effective_grid_fraction = None
         self.last_context_rms = None
-        self.last_interaction_abs_mean = None
         self.last_grid_has_text = None
         self.last_grid_note_count = None
         self.last_note_count = None
@@ -268,13 +236,10 @@ class HistoricalGridTextFusion(nn.Module):
         self.last_attention = relevance
         self.last_attention_entropy = None
         self.last_attention_max = None
-        self.last_cross_attention_entropy = None
-        self.last_cross_attention_max = None
         self.last_variable_attention_imbalance = None
         self.last_multi_note_patient_fraction = None
         self.last_time_weight_mean = None
         self.last_time_weight_max = None
-        self.last_effective_grid_fraction = numeric_features.new_zeros(())
         self.last_membership = torch.zeros(
             batch_size,
             num_notes,
@@ -283,7 +248,6 @@ class HistoricalGridTextFusion(nn.Module):
             device=numeric_features.device,
         )
         self.last_context_rms = None
-        self.last_interaction_abs_mean = None
         self.last_grid_has_text = torch.zeros(
             batch_size, q, dtype=torch.bool, device=numeric_features.device
         )
@@ -395,79 +359,20 @@ class HistoricalGridTextFusion(nn.Module):
         # variable. Padded reports are removed after normalization.
         attention = torch.softmax(scores.float(), dim=1)
         attention = attention * note_mask.view(b, 1, 1, k).float()
+        context = torch.einsum(
+            "bnhk,bqk,bkhd->bnqhd",
+            attention.to(value.dtype),
+            time_weight.to(value.dtype),
+            value,
+        )
         note_count = note_mask.sum(dim=1)
-        cross_attention = None
-        interaction_update = None
-        if self.fusion_mode == "add":
-            context = torch.einsum(
-                "bnhk,bqk,bkhd->bnqhd",
-                attention.to(value.dtype),
-                time_weight.to(value.dtype),
-                value,
-            )
-            context = context / note_count.clamp_min(1).view(
-                b, 1, 1, 1, 1
-            ).to(context.dtype)
-        else:
-            # Gauss-Hermite state at each (variable, grid time) is the query.
-            # The first numeric column is MTGNN's causal zero padding and has
-            # no matching text query.
-            numeric_grid = numeric_features[..., 1:].permute(0, 2, 3, 1)
-            numeric_state = self.numeric_norm(numeric_grid)
-            numeric_query = self.numeric_query_proj(numeric_state).view(
-                b, n, q, self.n_heads, self.head_dim
-            )
-            cross_scores = torch.einsum(
-                "bnqhd,bkhd->bnqhk",
-                numeric_query,
-                key,
-            ) / math.sqrt(self.head_dim)
-
-            # P(c, j, k) = semantic allocation(c, k) * time Gaussian(j, k).
-            # log P is an additive attention bias.  It keeps the interpretable
-            # priors while allowing the current numeric state to choose among
-            # multiple reports.
-            prior = attention.unsqueeze(2) * time_weight.view(
-                b, 1, q, 1, k
-            )
-            cross_scores = cross_scores.float() + prior.clamp_min(1e-8).log()
-            valid_note = note_mask.view(b, 1, 1, 1, k)
-            cross_scores = cross_scores.masked_fill(~valid_note, -1e4)
-            cross_attention = torch.softmax(cross_scores, dim=-1)
-            cross_attention = cross_attention * valid_note.to(
-                cross_attention.dtype
-            )
-            cross_attention = cross_attention / cross_attention.sum(
-                dim=-1, keepdim=True
-            ).clamp_min(1e-8)
-
-            selected_value = torch.einsum(
-                "bnqhk,bkhd->bnqhd",
-                cross_attention.to(value.dtype),
-                value,
-            )
-            # Softmax over reports would otherwise erase semantic/time
-            # relevance when K=1.  Preserve the old factorized amplitude while
-            # using cross-attention to decide which report content is read.
-            prior_mass = prior.sum(dim=-1) / note_count.clamp_min(1).view(
-                b, 1, 1, 1
-            ).to(prior.dtype)
-            context = selected_value * prior_mass.to(value.dtype).unsqueeze(-1)
-
+        context = context / note_count.clamp_min(1).view(
+            b, 1, 1, 1, 1
+        ).to(context.dtype)
         context = context.reshape(b, n, q, self.hidden)
 
-        # Residual fusion without a learned gate.  In cross mode the MLP sees
-        # both the text residual and its element-wise interaction with the
-        # normalized numeric state.  All layers are bias-free, so zero text
-        # still produces an exactly-zero update.
+        # Direct feature fusion: no learned post-context gate and no warmup.
         update_grid = self.context_out(context)
-        if self.fusion_mode == "cross":
-            interaction = torch.cat(
-                [update_grid, numeric_state * update_grid],
-                dim=-1,
-            )
-            interaction_update = self.cross_ffn(interaction)
-            update_grid = update_grid + interaction_update
         patient_has_text = note_mask.any(dim=1)
         grid_has_text = patient_has_text.view(b, 1).expand(b, q)
         update_grid = update_grid * grid_has_text.view(b, 1, q, 1).to(
@@ -500,55 +405,21 @@ class HistoricalGridTextFusion(nn.Module):
                 time_valid = note_mask.view(b, 1, k).expand(b, q, k)
                 time_weight_mean = time_weight[time_valid].mean()
                 time_weight_max = time_weight[time_valid].max()
-                effective_grid = (
-                    time_weight.max(dim=-1).values > 0.1
-                ) & patient_has_text.view(b, 1)
-                effective_grid_fraction = effective_grid[
-                    patient_has_text
-                ].to(torch.float32).mean()
-                if cross_attention is not None:
-                    cross_entropy = -(
-                        cross_attention.clamp_min(1e-8).log()
-                        * cross_attention
-                    ).sum(dim=-1)
-                    entropy_scale = note_count.clamp_min(2).float().log().view(
-                        b, 1, 1, 1
-                    )
-                    cross_entropy = cross_entropy / entropy_scale
-                    cross_valid = patient_has_text.view(b, 1, 1, 1).expand_as(
-                        cross_entropy
-                    )
-                    cross_attention_entropy = cross_entropy[cross_valid].mean()
-                    cross_attention_max = cross_attention.max(dim=-1).values[
-                        cross_valid
-                    ].mean()
-                else:
-                    cross_attention_entropy = None
-                    cross_attention_max = None
             else:
                 attention_entropy = None
                 attention_max = None
                 variable_imbalance = None
                 time_weight_mean = None
                 time_weight_max = None
-                effective_grid_fraction = None
-                cross_attention_entropy = None
-                cross_attention_max = None
             multi_note_fraction = (note_count[patient_has_text] > 1).to(
                 torch.float32
             ).mean()
             if valid_query.any():
                 context_rms = context[valid_query].square().mean().sqrt()
                 update_abs_mean = update_grid[valid_query].abs().mean()
-                interaction_abs_mean = (
-                    interaction_update[valid_query].abs().mean()
-                    if interaction_update is not None
-                    else None
-                )
             else:
                 context_rms = context.new_zeros(())
                 update_abs_mean = context.new_zeros(())
-                interaction_abs_mean = None
             # Keep the grid expansion for compatibility with per-variable
             # evaluation. Semantic allocation is constant over grid time; the
             # separate Gaussian supplies the temporal weight.
@@ -563,16 +434,6 @@ class HistoricalGridTextFusion(nn.Module):
             self.last_attention_max = (
                 attention_max.detach()
                 if torch.is_tensor(attention_max)
-                else None
-            )
-            self.last_cross_attention_entropy = (
-                cross_attention_entropy.detach()
-                if torch.is_tensor(cross_attention_entropy)
-                else None
-            )
-            self.last_cross_attention_max = (
-                cross_attention_max.detach()
-                if torch.is_tensor(cross_attention_max)
                 else None
             )
             self.last_variable_attention_imbalance = (
@@ -591,17 +452,7 @@ class HistoricalGridTextFusion(nn.Module):
                 if torch.is_tensor(time_weight_max)
                 else None
             )
-            self.last_effective_grid_fraction = (
-                effective_grid_fraction.detach()
-                if torch.is_tensor(effective_grid_fraction)
-                else None
-            )
             self.last_context_rms = context_rms.detach()
-            self.last_interaction_abs_mean = (
-                interaction_abs_mean.detach()
-                if torch.is_tensor(interaction_abs_mean)
-                else None
-            )
             self.last_grid_has_text = grid_has_text.detach()
             self.last_grid_note_count = note_count.view(b, 1).expand(b, q).detach()
             self.last_note_count = note_count.detach()
@@ -808,12 +659,6 @@ class GPINet(nn.Module):
                     dropout=float(args.dropout),
                     time_sigma_hours=float(
                         getattr(args, "gpinet_text_time_sigma_hours", 4.0)
-                    ),
-                    fusion_mode=str(
-                        getattr(args, "gpinet_text_fusion_mode", "cross")
-                    ),
-                    cross_ffn_ratio=float(
-                        getattr(args, "gpinet_text_cross_ffn_ratio", 2.0)
                     ),
                 )
         # populated on each forecasting() call for optional external logging

@@ -20,8 +20,6 @@ GP_QUERY_POINTS=24
 TEXT_HEADS=1
 TEXT_DIM=768
 TEXT_TIME_SIGMA_HOURS=4.0
-TEXT_FUSION_MODE="cross"
-TEXT_CROSS_FFN_RATIO=2.0
 FUSION_LR_MULTIPLIER=2.0
 
 usage() {
@@ -140,8 +138,6 @@ if [[ "$MODE" == "multi" ]]; then
         --n_heads_fusion "$TEXT_HEADS"
         --d_txt "$TEXT_DIM"
         --gpinet_text_time_sigma_hours "$TEXT_TIME_SIGMA_HOURS"
-        --gpinet_text_fusion_mode "$TEXT_FUSION_MODE"
-        --gpinet_text_cross_ffn_ratio "$TEXT_CROSS_FFN_RATIO"
         --fusion_lr_multiplier "$FUSION_LR_MULTIPLIER"
     )
 fi
