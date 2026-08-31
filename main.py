@@ -1179,11 +1179,16 @@ def trainable(
 
     # Keep the text branch on the same optimizer protocol as external TTF/MMF:
     # 2x learning rate, no weight decay, and independent gradient clipping.
-    native_text_parameters = (
-        list(model.text_grid_fusion.parameters())
-        if native_text_fusion
-        else []
-    )
+    native_text_parameters = []
+    if native_text_fusion:
+        native_text_parameters.extend(model.text_grid_fusion.parameters())
+        text_edge_logits = getattr(
+            getattr(model, "backbone", None),
+            "text_edge_logits",
+            None,
+        )
+        if isinstance(text_edge_logits, torch.nn.Parameter):
+            native_text_parameters.append(text_edge_logits)
     native_text_parameter_ids = {id(p) for p in native_text_parameters}
     model_parameters = [
         p for p in model.parameters() if id(p) not in native_text_parameter_ids
@@ -1437,8 +1442,9 @@ def trainable(
             if native_text_fusion:
                 logger.info(
                     "Val - Gaussian weight mean/max, text temporal "
-                    "variation, background RMS: {:.5f}, {:.5f}, {:.5f}, "
-                    "{:.5f}".format(
+                    "variation, background RMS, graph edge, text/numeric "
+                    "message ratio: {:.5f}, {:.5f}, {:.5f}, {:.5f}, "
+                    "{:.5f}, {:.5f}".format(
                         val_res.get(
                             "gpinet_text_gaussian_weight_mean",
                             float("nan"),
@@ -1453,6 +1459,14 @@ def trainable(
                         ),
                         val_res.get(
                             "gpinet_text_background_rms",
+                            float("nan"),
+                        ),
+                        val_res.get(
+                            "gpinet_text_graph_edge_mean",
+                            float("nan"),
+                        ),
+                        val_res.get(
+                            "gpinet_text_message_ratio_mean",
                             float("nan"),
                         ),
                     )

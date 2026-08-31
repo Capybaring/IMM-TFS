@@ -10,10 +10,9 @@ the project root (models/gpinet_mm.py), this file:
     training loop and evaluation code as every other baseline.
   - optionally maps irregular reports to the historical GP grid with a fixed
     Gaussian time kernel.  The resulting regular text sequence is appended as
-    one extra MTGNN node instead of being injected into every numerical node
-    before the graph backbone.  MTGNN therefore learns whether the background
-    node connects to each variable. Empty-text patients receive an exactly-zero
-    text node.
+    one extra MTGNN node. Numerical variables retain their original TopK graph,
+    while one learnable sigmoid edge per variable carries the text background
+    outside TopK. Empty-text patients receive an exactly-zero text path.
   - queries the decoder at the batch's actual `time_steps_to_predict`
     (variable, padded, continuous) instead of a fixed internal grid, since
     IMM-TSF's standard collate does not guarantee a fixed prediction length
@@ -362,13 +361,41 @@ class MixProp(nn.Module):
         self.project = nn.Conv2d(channels * (depth + 1), channels, 1)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, adjacency):
-        # x (B, F, N, M) ; adjacency (N, N)
+        self.last_text_message_ratio = None
+
+    def forward(self, x, adjacency, text_edge):
+        # x: (B, F, C+1, M); adjacency: (C, C); text_edge: (C,)
+        num_nodes = adjacency.shape[0]
+        if x.shape[2] != num_nodes + 1:
+            raise ValueError(
+                "MixProp expects C numerical nodes followed by one text node"
+            )
+        if text_edge.shape != (num_nodes,):
+            raise ValueError(
+                f"MixProp expected {num_nodes} text edges, got {tuple(text_edge.shape)}"
+            )
+
+        numeric_x = x[:, :, :num_nodes]
+        text_x = x[:, :, num_nodes:]
         states = [x]
-        h = x
+        numeric_h = numeric_x
         for _ in range(self.depth):
-            h = self.alpha * x + (1 - self.alpha) * torch.einsum("ij,bcjt->bcit", adjacency, h)
-            states.append(h)
+            numeric_message = torch.einsum(
+                "ij,bcjt->bcit", adjacency, numeric_h
+            )
+            text_message = (
+                text_edge.view(1, 1, num_nodes, 1) * text_x
+            )
+            numeric_h = self.alpha * numeric_x + (1 - self.alpha) * (
+                numeric_message + text_message
+            )
+            states.append(torch.cat([numeric_h, text_x], dim=2))
+
+        numeric_strength = numeric_message.detach().abs().mean(dim=(0, 1, 3))
+        text_strength = text_message.detach().abs().mean(dim=(0, 1, 3))
+        self.last_text_message_ratio = text_strength / (
+            numeric_strength + 1e-8
+        )
         return self.dropout(self.project(torch.cat(states, dim=1)))
 
 
@@ -392,8 +419,19 @@ class MTGNNEncoder(nn.Module):
     ):
         super().__init__()
         self.seq_length = seq_length
+        self.num_numeric_nodes = num_nodes
         self.start = nn.Conv2d(in_channels, hidden, 1)
         self.graph = GraphConstructor(num_nodes, subgraph_size, node_dim=node_dim)
+        # Text is a background source, not a competitor in the numerical TopK
+        # graph. A separate sigmoid edge gives every variable a differentiable
+        # route to the text node while allowing training to suppress it.
+        initial_text_edge = 0.1
+        initial_text_logit = math.log(
+            initial_text_edge / (1.0 - initial_text_edge)
+        )
+        self.text_edge_logits = nn.Parameter(
+            torch.full((num_nodes,), initial_text_logit)
+        )
         self.blocks = nn.ModuleList()
         for _ in range(layers):
             self.blocks.append(
@@ -407,18 +445,60 @@ class MTGNNEncoder(nn.Module):
             )
         self.dropout = nn.Dropout(dropout)
         self.temporal_agg = nn.Linear(hidden * seq_length, hid_dim)
+        self.last_text_edge = None
+        self.last_text_message_ratio = None
 
     def forward(self, x):
-        # x: (B, C_in, N, T)
+        # x: (B, C_in, C+1, T), with the text node last.
         if x.shape[-1] != self.seq_length:
             raise ValueError(f"MTGNNEncoder expected sequence length {self.seq_length}, got {x.shape[-1]}")
+        expected_nodes = self.num_numeric_nodes + 1
+        if x.shape[2] != expected_nodes:
+            raise ValueError(
+                f"MTGNNEncoder expected {expected_nodes} nodes, got {x.shape[2]}"
+            )
         adjacency = self.graph()
+        text_edge = torch.sigmoid(self.text_edge_logits)
+        # Convolution biases must not turn an absent text input into a phantom
+        # message. Keep the text state exactly zero for patients without notes.
+        text_present = (
+            x[:, :, self.num_numeric_nodes :, :]
+            .abs()
+            .sum(dim=(1, 2, 3), keepdim=True)
+            .gt(0)
+            .to(x.dtype)
+        )
         h = self.start(x)
+        h = torch.cat(
+            [
+                h[:, :, : self.num_numeric_nodes],
+                h[:, :, self.num_numeric_nodes :] * text_present,
+            ],
+            dim=2,
+        )
+        message_ratios = []
         for block in self.blocks:
             residual = h
             h = torch.tanh(block["temporal"](h))
-            h = block["graph"](h, adjacency)
+            h = torch.cat(
+                [
+                    h[:, :, : self.num_numeric_nodes],
+                    h[:, :, self.num_numeric_nodes :] * text_present,
+                ],
+                dim=2,
+            )
+            h = block["graph"](h, adjacency, text_edge)
+            message_ratios.append(block["graph"].last_text_message_ratio)
             h = block["norm"](h + residual)
+            h = torch.cat(
+                [
+                    h[:, :, : self.num_numeric_nodes],
+                    h[:, :, self.num_numeric_nodes :] * text_present,
+                ],
+                dim=2,
+            )
+        self.last_text_edge = text_edge.detach()
+        self.last_text_message_ratio = torch.stack(message_ratios).mean(dim=0)
         h = self.dropout(F.relu(h))  # (B, hidden, N, T)
         b, hd, n, t = h.shape
         h = h.permute(0, 2, 1, 3).reshape(b, n, hd * t)
@@ -480,7 +560,7 @@ class GPINet(nn.Module):
             self.hid_dim, k=int(getattr(args, "gpinet_gh_k", 3))
         )
         self.backbone = MTGNNEncoder(
-            self.N + 1,  # C numerical variables + one text-background node
+            self.N,  # C numerical variables; text uses a separate edge
             in_channels=self.hid_dim,
             seq_length=n_query + 1,  # +1 for the zero-padding column
             hid_dim=self.hid_dim,

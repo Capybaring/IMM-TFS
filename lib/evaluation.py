@@ -471,6 +471,10 @@ def evaluation(
     has_gate_diag = False
     has_null_probability_diag = False
     native_relevance_count = None
+    text_graph_edge_sum = None
+    text_graph_edge_count = 0
+    text_graph_message_ratio_sum = None
+    text_graph_message_ratio_count = 0
     diag_sum = {}
     diag_count = {}
 
@@ -553,6 +557,31 @@ def evaluation(
             mmf = getattr(fusion, "mmf", None) if fusion is not None else None
             if native_text:
                 text_module = getattr(model, "text_grid_fusion", None)
+                backbone = getattr(model, "backbone", None)
+                text_graph_edge = getattr(backbone, "last_text_edge", None)
+                text_message_ratio = getattr(
+                    backbone,
+                    "last_text_message_ratio",
+                    None,
+                )
+                if torch.is_tensor(text_graph_edge):
+                    edge = text_graph_edge.detach().to(base_se.device)
+                    if edge.numel() == base_se.numel():
+                        if text_graph_edge_sum is None:
+                            text_graph_edge_sum = torch.zeros_like(base_se)
+                        text_graph_edge_sum += edge.reshape_as(base_se)
+                        text_graph_edge_count += 1
+                if torch.is_tensor(text_message_ratio):
+                    ratio = text_message_ratio.detach().to(base_se.device)
+                    if ratio.numel() == base_se.numel():
+                        if text_graph_message_ratio_sum is None:
+                            text_graph_message_ratio_sum = torch.zeros_like(
+                                base_se
+                            )
+                        text_graph_message_ratio_sum += ratio.reshape_as(
+                            base_se
+                        )
+                        text_graph_message_ratio_count += 1
                 relevance = getattr(text_module, "last_relevance", None)
                 membership = getattr(text_module, "last_membership", None)
                 grid_has_text = getattr(
@@ -778,6 +807,30 @@ def evaluation(
             results["text_null_probability_per_variable"] = _to_named_dict(
                 names,
                 null_probability_var,
+            )
+
+        if text_graph_edge_sum is not None:
+            text_graph_edge_var = text_graph_edge_sum / max(
+                text_graph_edge_count,
+                1,
+            )
+            results["gpinet_text_graph_edge_per_variable"] = _to_named_dict(
+                names,
+                text_graph_edge_var,
+            )
+            results["gpinet_text_graph_edge_mean"] = (
+                text_graph_edge_var.mean().item()
+            )
+        if text_graph_message_ratio_sum is not None:
+            text_graph_message_ratio_var = text_graph_message_ratio_sum / max(
+                text_graph_message_ratio_count,
+                1,
+            )
+            results["gpinet_text_message_ratio_per_variable"] = (
+                _to_named_dict(names, text_graph_message_ratio_var)
+            )
+            results["gpinet_text_message_ratio_mean"] = (
+                text_graph_message_ratio_var.mean().item()
             )
 
     for name, value_sum in diag_sum.items():
