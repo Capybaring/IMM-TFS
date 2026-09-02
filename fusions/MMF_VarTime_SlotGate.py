@@ -1,4 +1,4 @@
-# BUILD_ID: variable-time-note-cross-attention-paper-head-v4-20260830
+# BUILD_ID: objective-neutral-slot-gate-v8-20260829
 import math
 
 import torch
@@ -6,7 +6,7 @@ import torch.nn as nn
 
 
 class FutureTime2Vec(nn.Module):
-    """Learnable linear and periodic encoding for future query times."""
+    """Learnable linear + periodic encoding for future query times."""
 
     def __init__(self, d_time: int):
         super().__init__()
@@ -15,33 +15,25 @@ class FutureTime2Vec(nn.Module):
         self.linear = nn.Linear(1, 1)
         self.periodic = nn.Linear(1, d_time - 1)
 
-    def forward(self, value: torch.Tensor) -> torch.Tensor:
-        return torch.cat(
-            [self.linear(value), torch.sin(self.periodic(value))],
-            dim=-1,
-        )
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        return torch.cat([self.linear(t), torch.sin(self.periodic(t))], dim=-1)
 
 
 class MMF_VarTime_SlotGate(nn.Module):
-    """Variable-time soft cross-attention over unaggregated note tokens.
+    """Variable-time residual fusion over semantic text slots.
 
-    The legacy class and file names are preserved for existing scripts.  The
-    module no longer performs semantic-slot classification, hard routing, a
-    NULL categorical decision, or indirect variable-graph propagation.
-    Instead, every variable/future-time query softly attends to all aligned
-    real notes.  This variable-time cross-attention replaces the paper's GRU.
-    Downstream prediction fusion still follows MMF_GR_Add: a linear residual
-    head, channel-wise LayerNorm, Dropout, the same 1-sigmoid text gate, and
-    residual addition to the numerical forecast.
+    Real-slot attention selects text content; the variable-time relevance gate
+    rejects unhelpful text.  During a short training warmup the gate is held at
+    a non-zero value so the residual and TTF branches can learn before the gate
+    is allowed to close.  This avoids the multiplicative cold start
+    ``correction = kappa * gate * delta`` that previously drove every gate to
+    approximately zero.
 
-    Preferred shapes:
+    Shapes:
         Y_ts:  (B, T, C)
-        E_txt: (B, T, K, d_txt)
-        M_txt: (B, T, K)
+        E_txt: (B, T, d_txt), containing H contiguous semantic slots
+        M_txt: sample-level text mask
         t_hat: (B, T) or (T,)
-
-    A legacy (B, T, d_txt) E_txt input is accepted as one note token per
-    future time to keep older TTF/MMF pairings from failing immediately.
     """
 
     def __init__(
@@ -57,16 +49,21 @@ class MMF_VarTime_SlotGate(nn.Module):
         delta_init_std: float = 1e-2,
         gate_warmup_epochs: int = 5,
         gate_warmup_value: float = 0.5,
-        null_logit_bias: float | None = None,
-        indirect_strength: float = 0.1,
-        indirect_temperature: float = 0.5,
+        null_logit_bias: float = 1.0,
     ):
         super().__init__()
 
         if C < 1:
             raise ValueError("C must be >= 1")
-        if d_txt < 1:
-            raise ValueError("d_txt must be >= 1")
+        if semantic_slots < 2:
+            raise ValueError(
+                "MMF_VarTime_SlotGate requires semantic_slots >= 2; "
+                "one slot makes slot attention identically one"
+            )
+        if d_txt % semantic_slots != 0:
+            raise ValueError(
+                f"d_txt={d_txt} must be divisible by semantic_slots={semantic_slots}"
+            )
         if d_attn < 1:
             raise ValueError("d_attn must be >= 1")
         if n_heads_fusion < 1 or d_attn % n_heads_fusion != 0:
@@ -83,30 +80,21 @@ class MMF_VarTime_SlotGate(nn.Module):
         if not 0.0 < gate_warmup_value <= 1.0:
             raise ValueError("gate_warmup_value must be in (0, 1]")
 
-        # Retain obsolete constructor arguments so the existing CLI and
-        # FusionModel do not need to change in this first iteration.
-        self.legacy_semantic_slots = int(semantic_slots)
-        self.legacy_null_logit_bias = (
-            None if null_logit_bias is None else float(null_logit_bias)
-        )
-        self.legacy_indirect_strength = float(indirect_strength)
-        self.legacy_indirect_temperature = float(indirect_temperature)
-
         self.C = int(C)
         self.d_txt = int(d_txt)
         self.d_attn = int(d_attn)
+        self.semantic_slots = int(semantic_slots)
+        self.slot_dim = self.d_txt // self.semantic_slots
         self.n_heads = int(n_heads_fusion)
         self.head_dim = self.d_attn // self.n_heads
-        # ``kappa`` is kept only for CLI/configuration compatibility because
-        # paper-style GR-Add does not use it.  Gate warmup remains enabled for
-        # the current training protocol as requested.
         self.kappa = float(kappa)
-        self.legacy_delta_init_std = float(delta_init_std)
         self.gate_warmup_epochs = int(gate_warmup_epochs)
         self.gate_warmup_value = float(gate_warmup_value)
         self.training_epoch = 0
+        # Retained only for constructor compatibility with older runners and
+        # checkpoints.  NULL no longer participates in attention or gating.
+        del null_logit_bias
 
-        # Variable/future-time query.
         self.local_value_proj = nn.Linear(1, self.d_attn, bias=False)
         self.global_state_proj = nn.Linear(self.C, self.d_attn, bias=False)
         self.variable_embedding = nn.Parameter(
@@ -117,54 +105,50 @@ class MMF_VarTime_SlotGate(nn.Module):
         self.time_proj = nn.Linear(d_time, self.d_attn, bias=False)
         self.query_norm = nn.LayerNorm(self.d_attn)
 
-        # Note keys and values.  Attention is implemented explicitly so the
-        # same K note tokens can be queried independently by all C variables.
-        self.note_norm = nn.LayerNorm(self.d_txt)
-        self.note_key = nn.Linear(self.d_txt, self.d_attn, bias=False)
-        self.note_value = nn.Linear(self.d_txt, self.d_attn, bias=False)
-        self.attention_dropout = nn.Dropout(dropout)
-        self.context_out = nn.Linear(self.d_attn, self.d_attn, bias=False)
-        self.context_norm = nn.LayerNorm(self.d_attn)
+        # Normalize slot direction before attention, then restore its RMS in
+        # forward().  Plain LayerNorm would erase TTF's recency and slot-mass
+        # strengths, making those controls ineffective for every non-zero slot.
+        self.slot_norm = nn.LayerNorm(self.slot_dim)
+        self.slot_key = nn.Linear(self.slot_dim, self.d_attn, bias=False)
+        self.slot_value = nn.Linear(self.slot_dim, self.d_attn, bias=False)
 
-        # Cross-attention replaces the paper GRU.  Its per-variable query and
-        # attended text context form the representation consumed by the same
-        # style of linear residual head and gate used by MMF_GR_Add.
-        self.fusion_dim = 2 * self.d_attn
-        self.residual_head = nn.Linear(self.fusion_dim, 1)
-        self.layer_norm = nn.LayerNorm(self.C)
-        self.residual_dropout = nn.Dropout(dropout)
-        self.gate_net = nn.Linear(self.fusion_dim, 1)
+        self.gate_net = nn.Sequential(
+            nn.Linear(4 * self.d_attn, self.d_attn),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.d_attn, 1),
+        )
+        # A small non-zero weight lets gate decisions depend on text/numeric
+        # interactions as soon as warmup ends.  A zero final layer made every
+        # patient, variable and future time start with the same gate.
+        nn.init.normal_(self.gate_net[-1].weight, mean=0.0, std=1e-2)
+        nn.init.constant_(self.gate_net[-1].bias, float(gate_bias))
 
-        # The old per-variable residual MLP and its custom gate bias are no
-        # longer part of the forward graph.  Preserve the value for experiment
-        # metadata/checkpoint diagnostics only.
-        self.legacy_gate_bias = float(gate_bias)
+        self.delta_hidden = nn.Sequential(
+            nn.Linear(2 * self.d_attn, self.d_attn, bias=False),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.delta_out = nn.Linear(self.d_attn, 1, bias=False)
+        nn.init.normal_(
+            self.delta_out.weight,
+            mean=0.0,
+            std=float(delta_init_std),
+        )
 
-        # Evaluation capability flags.
-        self.supports_null_diagnostic = False
-        self.supports_strict_slot_routing = False
-        self.supports_indirect_diagnostic = False
-
-        # Existing diagnostic names are retained even though their semantics
-        # are now note-level attention rather than slot-level routing.
         self.last_slot_attention = None
-        self.last_note_attention = None
         self.last_null_probability = None
         self.last_gate = None
         self.last_variable_relevance = None
         self.last_delta = None
         self.last_correction = None
         self.last_candidate_correction = None
-        self.last_direct_correction = None
-        self.last_indirect_correction = None
         self.last_text_mask = None
         self.last_context = None
-        self.last_active_slot_mask = None
-        self.last_hard_slot_choice = None
-        self.last_variable_adjacency = None
         self.last_gate_warmup_active = False
 
     def set_training_epoch(self, epoch: int) -> None:
+        """Inform the fusion gate which training epoch is about to run."""
         if epoch < 0:
             raise ValueError("epoch must be >= 0")
         self.training_epoch = int(epoch)
@@ -196,60 +180,6 @@ class MMF_VarTime_SlotGate(nn.Module):
             )
         return t_hat
 
-    def _prepare_note_tokens(
-        self,
-        E_txt: torch.Tensor,
-        M_txt: torch.Tensor,
-        batch_size: int,
-        future_steps: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if E_txt.ndim == 3:
-            expected = (batch_size, future_steps, self.d_txt)
-            if E_txt.shape != expected:
-                raise ValueError(
-                    f"Expected legacy E_txt shape {expected}, "
-                    f"got {tuple(E_txt.shape)}"
-                )
-            E_txt = E_txt.unsqueeze(2)
-        elif E_txt.ndim != 4:
-            raise ValueError(
-                "E_txt must have shape (B,T,K,d_txt) or legacy "
-                f"(B,T,d_txt), got {tuple(E_txt.shape)}"
-            )
-
-        B, T, K, D = E_txt.shape
-        if (B, T, D) != (batch_size, future_steps, self.d_txt):
-            raise ValueError(
-                "Expected E_txt leading/trailing dimensions "
-                f"{(batch_size, future_steps, self.d_txt)}, "
-                f"got {tuple(E_txt.shape)}"
-            )
-
-        mask = M_txt.to(torch.bool)
-        if mask.ndim == 3 and mask.shape == (B, T, K):
-            return E_txt, mask
-        if mask.ndim == 2:
-            if mask.shape == (B, K):
-                return E_txt, mask[:, None, :].expand(-1, T, -1)
-            if K == 1 and mask.shape == (B, T):
-                return E_txt, mask.unsqueeze(-1)
-            if mask.shape == (B, 1):
-                return E_txt, mask[:, None, :].expand(-1, T, K)
-        if mask.ndim == 1 and mask.shape == (B,):
-            return E_txt, mask[:, None, None].expand(-1, T, K)
-
-        raise ValueError(
-            "M_txt must be compatible with (B,T,K); got "
-            f"{tuple(mask.shape)} for {(B, T, K)}"
-        )
-
-    @staticmethod
-    def _require_finite(name: str, value: torch.Tensor) -> None:
-        if not torch.isfinite(value).all():
-            raise FloatingPointError(
-                f"MMF_VarTime_SlotGate produced NaN or Inf in {name}"
-            )
-
     def forward(
         self,
         Y_ts: torch.Tensor,
@@ -259,31 +189,41 @@ class MMF_VarTime_SlotGate(nn.Module):
     ) -> torch.Tensor:
         if Y_ts.ndim != 3:
             raise ValueError(
-                f"Y_ts must have shape (B,T,C), got {tuple(Y_ts.shape)}"
+                f"Y_ts must have shape (B, T, C), got {tuple(Y_ts.shape)}"
             )
+        if E_txt.ndim != 3:
+            raise ValueError(
+                f"E_txt must have shape (B, T, d_txt), got {tuple(E_txt.shape)}"
+            )
+
         B, T, C = Y_ts.shape
         if C != self.C:
             raise ValueError(f"Expected C={self.C}, got C={C}")
-        self._require_finite("numerical forecast", Y_ts)
+        if E_txt.shape != (B, T, self.d_txt):
+            raise ValueError(
+                f"Expected E_txt shape {(B, T, self.d_txt)}, "
+                f"got {tuple(E_txt.shape)}"
+            )
+        if not torch.isfinite(Y_ts).all():
+            raise ValueError("Numerical forecast contains NaN or Inf values")
+        if not torch.isfinite(E_txt).all():
+            raise ValueError("Text features contain NaN or Inf values")
 
-        E_txt, note_mask = self._prepare_note_tokens(
-            E_txt,
-            M_txt,
-            B,
-            T,
-        )
-        self._require_finite("aligned note tokens", E_txt)
-        K = E_txt.shape[2]
         t_hat = self._prepare_time(t_hat, B, T, Y_ts)
+        has_text = M_txt.to(torch.bool).reshape(B, -1).any(dim=1)
+        text_mask = has_text.view(B, 1, 1).to(Y_ts.dtype)
 
-        has_text = note_mask.any(dim=-1)
-        text_mask = has_text.unsqueeze(-1).to(Y_ts.dtype)
+        E_slots = E_txt.reshape(B, T, self.semantic_slots, self.slot_dim)
+        slot_rms = (
+            E_slots.float().square().mean(dim=-1, keepdim=True).sqrt()
+        ).to(E_slots.dtype)
+        E_slots = self.slot_norm(E_slots) * slot_rms
 
-        # Match the paper's end-to-end fusion: the GRU/gate/attention paths may
-        # all backpropagate into the numerical forecasting backbone.
-        numeric_source = Y_ts
-        local_state = self.local_value_proj(numeric_source.unsqueeze(-1))
-        global_state = self.global_state_proj(numeric_source).unsqueeze(2)
+        # Detach only the residual-query input.  The explicit addition at the
+        # end keeps the normal identity gradient to the numerical backbone.
+        numeric_query_source = Y_ts.detach()
+        local_state = self.local_value_proj(numeric_query_source.unsqueeze(-1))
+        global_state = self.global_state_proj(numeric_query_source).unsqueeze(2)
         variable_state = self.variable_embedding.view(1, 1, C, self.d_attn)
         time_state = self.time_proj(
             self.time2vec(t_hat.unsqueeze(-1))
@@ -292,112 +232,85 @@ class MMF_VarTime_SlotGate(nn.Module):
             local_state + global_state + variable_state + time_state
         )
 
-        if K == 0:
-            context = Y_ts.new_zeros((B, T, C, self.d_attn))
-            attention = Y_ts.new_zeros((B, T, C, self.n_heads, 0))
-        else:
-            note_tokens = self.note_norm(E_txt)
-            keys = self.note_key(note_tokens)
-            values = self.note_value(note_tokens)
+        real_keys = self.slot_key(E_slots)
+        real_values = self.slot_value(E_slots)
 
-            q_heads = query.reshape(
-                B,
-                T,
-                C,
-                self.n_heads,
-                self.head_dim,
-            )
-            k_heads = keys.reshape(
-                B,
-                T,
-                K,
-                self.n_heads,
-                self.head_dim,
-            )
-            v_heads = values.reshape(
-                B,
-                T,
-                K,
-                self.n_heads,
-                self.head_dim,
-            )
-
-            scores = torch.einsum(
-                "btchd,btkhd->btchk",
-                q_heads.float(),
-                k_heads.float(),
-            ) / math.sqrt(self.head_dim)
-            valid = note_mask[:, :, None, None, :]
-            attention = torch.softmax(
-                scores.masked_fill(~valid, -1e4),
-                dim=-1,
-            )
-            attention = attention * valid.to(attention.dtype)
-            attention = attention / attention.sum(
-                dim=-1,
-                keepdim=True,
-            ).clamp_min(1e-8)
-            self._require_finite("note attention", attention)
-
-            context_weights = self.attention_dropout(attention).to(
-                v_heads.dtype
-            )
-            context_heads = torch.einsum(
-                "btchk,btkhd->btchd",
-                context_weights,
-                v_heads,
-            )
-            context = context_heads.reshape(B, T, C, self.d_attn)
-            context = self.context_norm(self.context_out(context))
-
-        # Variable-time attention is the learned fusion operator that replaces
-        # the paper GRU.  Everything below follows the paper GR-Add output
-        # fusion: linear residual, LayerNorm, Dropout, gate, and residual add.
-        fusion_features = torch.cat([query, context], dim=-1)
-        delta_y = self.residual_head(fusion_features).squeeze(-1)
-        delta_norm = self.layer_norm(delta_y)
-        delta_drop = self.residual_dropout(delta_norm)
-
-        # Keep the same gate orientation as MMF_GR_Add: sigmoid(gate_logits)
-        # is the base-preservation gate and 1-g is the effective text gate.
-        base_gate = torch.sigmoid(
-            self.gate_net(fusion_features).squeeze(-1)
+        slot_count = self.semantic_slots
+        q_heads = query.reshape(B, T, C, self.n_heads, self.head_dim)
+        k_heads = real_keys.reshape(
+            B, T, slot_count, self.n_heads, self.head_dim
         )
-        learned_gate = 1.0 - base_gate
+        v_heads = real_values.reshape(
+            B, T, slot_count, self.n_heads, self.head_dim
+        )
+
+        scores = torch.einsum(
+            "btchd,btshd->btchs", q_heads, k_heads
+        ) / math.sqrt(self.head_dim)
+        attention = torch.softmax(scores, dim=-1)
+
+        context_heads = torch.einsum(
+            "btchs,btshd->btchd", attention, v_heads
+        )
+        context = context_heads.reshape(B, T, C, self.d_attn)
+
+        # Kept as an all-zero diagnostic for compatibility with the existing
+        # evaluation output.  It is not part of the forward computation.
+        null_probability = Y_ts.new_zeros(B, T, C)
+
+        interaction = torch.cat(
+            [query, context, query * context, torch.abs(query - context)],
+            dim=-1,
+        )
+        gate_logits = self.gate_net(interaction).squeeze(-1)
+        learned_relevance = torch.sigmoid(gate_logits)
+
+        # Do not let the rejection gate kill an untrained residual.  The fixed
+        # forward gate lets the residual/attention/TTF path receive gradients
+        # before learned rejection begins, without any auxiliary objective.
         warmup_active = (
             self.training
             and self.training_epoch < self.gate_warmup_epochs
         )
         if warmup_active:
-            gate = torch.full_like(
-                learned_gate,
+            variable_relevance = torch.full_like(
+                learned_relevance,
                 self.gate_warmup_value,
             )
         else:
-            gate = learned_gate
-        gate = gate * text_mask
-        candidate_correction = delta_drop * text_mask
+            variable_relevance = learned_relevance
+
+        # The variable-time gate is now the sole learned rejection mechanism.
+        # text_mask still guarantees exact identity when a sample has no text.
+        gate = variable_relevance * text_mask
+
+        delta_features = torch.cat([context, query * context], dim=-1)
+        delta_text = torch.tanh(
+            self.delta_out(self.delta_hidden(delta_features)).squeeze(-1)
+        )
+
+        candidate_correction = self.kappa * delta_text * text_mask
         correction = gate * candidate_correction
         Y_out = Y_ts + correction
-        self._require_finite("fused forecast", Y_out)
 
-        note_attention = attention.mean(dim=3).to(Y_ts.dtype)
-        zeros = torch.zeros_like(correction)
-        self.last_slot_attention = note_attention.detach()
-        self.last_note_attention = note_attention.detach()
-        self.last_null_probability = zeros.detach()
+        # Preserve the old H+1 diagnostic shape by appending a zero-probability
+        # NULL column.  This keeps evaluation entropy code valid when H == 1.
+        diagnostic_attention = torch.cat(
+            [
+                attention.mean(dim=-2),
+                null_probability.unsqueeze(-1),
+            ],
+            dim=-1,
+        )
+        self.last_slot_attention = diagnostic_attention.detach()
+        self.last_null_probability = null_probability.detach()
         self.last_gate = gate.detach()
-        self.last_variable_relevance = gate.detach()
-        self.last_delta = delta_drop.detach()
+        self.last_variable_relevance = variable_relevance.detach()
+        self.last_delta = delta_text.detach()
         self.last_correction = correction.detach()
         self.last_candidate_correction = candidate_correction.detach()
-        self.last_direct_correction = correction.detach()
-        self.last_indirect_correction = zeros.detach()
         self.last_text_mask = text_mask.detach()
         self.last_context = context.detach()
-        self.last_active_slot_mask = note_mask.detach()
-        self.last_hard_slot_choice = None
-        self.last_variable_adjacency = Y_ts.new_zeros(C, C)
         self.last_gate_warmup_active = bool(warmup_active)
 
         return Y_out
