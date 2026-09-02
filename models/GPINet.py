@@ -8,11 +8,11 @@ the project root (models/gpinet_mm.py), this file:
     truth_time_steps, mask)` contract shared by every model in this repo
     (see models/tPatchGNN.py, models/CRU.py), so it plugs into the same
     training loop and evaluation code as every other baseline.
-  - optionally maps irregular reports to the historical GP grid with a fixed
-    Gaussian time kernel.  The resulting regular text sequence is appended as
-    one extra MTGNN node. Numerical variables retain their original TopK graph,
-    while one learnable sigmoid edge per variable carries the text background
-    outside TopK. Empty-text patients receive an exactly-zero text path.
+  - optionally aligns pre-computed report embeddings to the historical GP
+    grid and fuses them with Gauss-Hermite features *before* the MTGNN
+    temporal/graph blocks. Reports are assigned to the first grid point at
+    or after their timestamp, so future text never leaks into an earlier
+    state and empty grid points receive an exactly-zero text update.
   - queries the decoder at the batch's actual `time_steps_to_predict`
     (variable, padded, continuous) instead of a fixed internal grid, since
     IMM-TSF's standard collate does not guarantee a fixed prediction length
@@ -142,119 +142,160 @@ class GaussHermiteFusionModule(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Gaussian time alignment for the MTGNN text-background node
+# Semantic-variable allocation and time-aware text fusion
 # ─────────────────────────────────────────────────────────────────────────
 
 
-class GaussianTextBackground(nn.Module):
-    """Map irregular reports to one regular MTGNN background node.
+class HistoricalGridTextFusion(nn.Module):
+    """Factor text influence into semantic-variable and temporal weights.
 
-    For grid time ``g_q`` and report time ``tau_j``, the absolute (non-softmax)
-    weight is ``exp(-(g_q - tau_j)^2 / (2 sigma^2))``.  The bounded aggregate
-
-        sum_j w_qj W_e e_j / (1 + sum_j w_qj)
-
-    preserves absolute temporal strength: a single distant report approaches
-    zero instead of receiving softmax weight one.  This module performs no
-    variable matching and no numerical/text cross-attention.  Its output is a
-    single regular node; MTGNN performs all variable selection through its
-    learned graph.
+    Every report first distributes its semantic content over the variables by
+    softmax across learned variable prototypes. Its original timestamp then
+    produces a Gaussian weight over every historical GP grid point. The outer
+    product of these two weights creates a regular variable-time text feature
+    map that is added directly to the Gauss-Hermite feature before MTGNN.
     """
 
     def __init__(
         self,
         d_txt,
         hidden,
+        num_nodes,
         t_query,
         history_window,
         total_window,
-        sigma_hours=3.0,
+        n_heads=1,
+        dropout=0.1,
+        time_sigma_hours=4.0,
     ):
         super().__init__()
+        if n_heads < 1:
+            raise ValueError("n_heads_fusion must be >= 1")
+        if hidden % n_heads != 0:
+            raise ValueError(
+                f"GPINet text hidden size {hidden} must be divisible by "
+                f"n_heads_fusion={n_heads}"
+            )
         if total_window <= 0 or history_window <= 0:
             raise ValueError("history and history + pred_window must be positive")
         if history_window > total_window:
             raise ValueError("history cannot exceed history + pred_window")
-        if float(sigma_hours) <= 0:
-            raise ValueError("Gaussian text sigma must be positive")
+        if time_sigma_hours <= 0:
+            raise ValueError("GPINet text time sigma must be positive")
 
-        self.d_txt = int(d_txt)
         self.hidden = int(hidden)
-        self.history_window = float(history_window)
+        self.num_nodes = int(num_nodes)
+        self.n_heads = int(n_heads)
+        self.head_dim = self.hidden // self.n_heads
         self.total_window = float(total_window)
-        self.sigma_hours = float(sigma_hours)
+        self.history_end = float(history_window) / self.total_window
+        self.time_sigma_hours = float(time_sigma_hours)
         self.register_buffer("t_query", t_query.detach().float().clone())
-        # Bias-free: a text node must come from report content, not from a
-        # learned time-shaped constant multiplied by the Gaussian mass.
-        self.text_proj = nn.Linear(self.d_txt, self.hidden, bias=False)
 
-        # Optional evaluation diagnostics populated on each forward pass.
+        self.content_proj = nn.Sequential(
+            nn.Linear(int(d_txt), self.hidden),
+            nn.GELU(),
+            nn.LayerNorm(self.hidden),
+        )
+        self.variable_embedding = nn.Parameter(
+            torch.randn(self.num_nodes, self.hidden) * 0.02
+        )
+        self.query_norm = nn.LayerNorm(self.hidden)
+        self.key_proj = nn.Linear(self.hidden, self.hidden)
+        self.value_proj = nn.Linear(self.hidden, self.hidden)
+        self.query_proj = nn.Linear(self.hidden, self.hidden)
+        # Bias-free output projection preserves the exact zero update for an
+        # empty grid.
+        self.context_out = nn.Linear(self.hidden, self.hidden, bias=False)
+        self.dropout = nn.Dropout(float(dropout))
+
+        # Detached diagnostics from the most recent forward pass.
         self.last_relevance = None
         self.last_membership = None
-        self.last_text_temporal_variation = None
+        self.last_attention = None
+        self.last_attention_entropy = None
+        self.last_attention_max = None
+        self.last_variable_attention_imbalance = None
         self.last_multi_note_patient_fraction = None
-        self.last_background_rms = None
-        self.last_gaussian_weight_mean = None
-        self.last_gaussian_weight_max = None
+        self.last_time_weight_mean = None
+        self.last_time_weight_max = None
+        self.last_context_rms = None
         self.last_grid_has_text = None
-        self.last_grid_weight_mass = None
+        self.last_grid_note_count = None
         self.last_note_count = None
         self.last_note_grid_index = None
+        self.last_update_abs_mean = None
 
-    def _record_empty(self, numeric_features, batch_size, num_notes):
-        q = int(self.t_query.numel())
-        device = numeric_features.device
-        self.last_relevance = None
-        self.last_membership = None
-        self.last_text_temporal_variation = None
-        self.last_multi_note_patient_fraction = None
-        self.last_background_rms = None
-        self.last_gaussian_weight_mean = None
-        self.last_gaussian_weight_max = None
-        self.last_grid_has_text = torch.zeros(
-            batch_size, q, dtype=torch.bool, device=device
+    def _empty_update(self, numeric_features, batch_size, num_notes=0):
+        q = self.t_query.numel()
+        update = torch.zeros_like(numeric_features)
+        relevance = numeric_features.new_zeros(
+            (batch_size, self.num_nodes, q, num_notes)
         )
-        self.last_grid_weight_mass = numeric_features.new_zeros((batch_size, q))
+        self.last_relevance = relevance
+        self.last_attention = relevance
+        self.last_attention_entropy = None
+        self.last_attention_max = None
+        self.last_variable_attention_imbalance = None
+        self.last_multi_note_patient_fraction = None
+        self.last_time_weight_mean = None
+        self.last_time_weight_max = None
+        self.last_membership = torch.zeros(
+            batch_size,
+            num_notes,
+            q,
+            dtype=torch.bool,
+            device=numeric_features.device,
+        )
+        self.last_context_rms = None
+        self.last_grid_has_text = torch.zeros(
+            batch_size, q, dtype=torch.bool, device=numeric_features.device
+        )
+        self.last_grid_note_count = numeric_features.new_zeros((batch_size, q))
         self.last_note_count = numeric_features.new_zeros((batch_size,))
         self.last_note_grid_index = torch.full(
-            (batch_size, num_notes), -1, dtype=torch.long, device=device
+            (batch_size, num_notes),
+            -1,
+            dtype=torch.long,
+            device=numeric_features.device,
         )
+        self.last_update_abs_mean = None
+        return update
 
     def forward(self, numeric_features, notes_input, tau_raw):
-        # numeric_features: (B, H, C, Q), used only for shape/device/dtype.
-        b, hidden, _, numeric_q = numeric_features.shape
-        q = int(self.t_query.numel())
-        if hidden != self.hidden:
-            raise ValueError(f"Expected {self.hidden} hidden channels, got {hidden}")
-        if numeric_q != q:
-            raise ValueError(f"Expected {q} historical GP columns, got {numeric_q}")
-
+        # numeric_features: (B, H, N, Q+1), with a zero-padding first column.
         if notes_input is None or tau_raw is None:
-            self._record_empty(numeric_features, b, 0)
-            return numeric_features.new_zeros((b, self.hidden, 1, q))
+            return numeric_features
         if notes_input.dim() != 3:
             raise ValueError(
-                "GPINet text background expects pre-computed embeddings "
+                "GPINet native text fusion expects pre-computed embeddings "
                 "with shape (B, K, d_txt)"
             )
         if tau_raw.dim() != 2:
             raise ValueError("tau_raw must have shape (B, K)")
 
+        b, _, n, padded_q = numeric_features.shape
+        if n != self.num_nodes:
+            raise ValueError(f"Expected {self.num_nodes} variables, got {n}")
+        q = self.t_query.numel()
+        if padded_q != q + 1:
+            raise ValueError(
+                f"Expected {q + 1} GP columns (including padding), got {padded_q}"
+            )
         if notes_input.shape[:2] != tau_raw.shape:
             raise ValueError(
                 "notes_input and tau_raw must agree on batch and report dimensions"
             )
-        if notes_input.shape[-1] != self.d_txt:
+        k = notes_input.shape[1]
+        if k == 0:
+            return numeric_features + self._empty_update(numeric_features, b, 0)
+        expected_d_txt = self.content_proj[0].in_features
+        if notes_input.shape[-1] != expected_d_txt:
             raise ValueError(
-                f"GPINet expected text embedding size {self.d_txt}, "
+                f"GPINet expected text embedding size {expected_d_txt}, "
                 f"got {notes_input.shape[-1]}; set --d_txt to match the "
                 "pre-computed embedding file"
             )
-
-        k = int(notes_input.shape[1])
-        if k == 0:
-            self._record_empty(numeric_features, b, 0)
-            return numeric_features.new_zeros((b, self.hidden, 1, q))
 
         notes_input = notes_input.to(
             device=numeric_features.device, dtype=numeric_features.dtype
@@ -264,74 +305,167 @@ class GaussianTextBackground(nn.Module):
         )
         note_mask = torch.isfinite(notes_input).all(dim=-1)
         note_mask = note_mask & (notes_input.abs().sum(dim=-1) > 0)
+        tau_norm = tau_raw / self.total_window
+        # The original GPINet grid represents [0, history) (0..23 h for the
+        # 24 h MIMIC history), so the final query is one step before the true
+        # history boundary. Use the boundary rather than t_query[-1] when
+        # validating reports, otherwise notes from the final hour are lost.
+        history_end = tau_norm.new_tensor(self.history_end)
         note_mask = (
             note_mask
-            & torch.isfinite(tau_raw)
-            & (tau_raw >= 0)
-            & (tau_raw <= tau_raw.new_tensor(self.history_window) + 1e-7)
+            & torch.isfinite(tau_norm)
+            & (tau_norm >= 0)
+            & (tau_norm <= history_end + 1e-7)
         )
         if not note_mask.any():
-            self._record_empty(numeric_features, b, k)
-            return numeric_features.new_zeros((b, self.hidden, 1, q))
+            return numeric_features + self._empty_update(numeric_features, b, k)
 
-        notes_value = notes_input.masked_fill(~note_mask.unsqueeze(-1), 0)
-        tau_safe = tau_raw.masked_fill(~note_mask, 0)
-        grid_hours = self.t_query.to(
+        notes_input = notes_input.masked_fill(~note_mask.unsqueeze(-1), 0)
+        tau_norm = tau_norm.masked_fill(~note_mask, 0)
+        tau_hours = tau_raw.masked_fill(~note_mask, 0)
+
+        # Each report influences every historical grid point through a
+        # Gaussian of its exact timestamp. This is a weighted diffusion, not
+        # uniform replication over the 24-hour grid.
+        grid_times = self.t_query.to(
             device=numeric_features.device, dtype=numeric_features.dtype
-        ) * self.total_window
-        time_delta = grid_hours.view(1, q, 1) - tau_safe.view(b, 1, k)
-        gaussian_weight = torch.exp(
-            -0.5 * (time_delta / self.sigma_hours).square()
         )
-        gaussian_weight = gaussian_weight * note_mask.view(b, 1, k).to(
-            gaussian_weight.dtype
+        grid_hours = grid_times * self.total_window
+        time_delta = grid_hours.view(1, q, 1).float() - tau_hours.view(
+            b, 1, k
+        ).float()
+        time_weight = torch.exp(
+            -0.5 * (time_delta / self.time_sigma_hours).square()
         )
+        time_weight = time_weight * note_mask.view(b, 1, k).float()
 
-        projected_text = self.text_proj(notes_value)
-        numerator = torch.einsum(
-            "bqk,bkh->bqh", gaussian_weight, projected_text
+        # Semantic allocation deliberately excludes timestamps: a report is
+        # matched once against all learned variable prototypes, independently
+        # of where it occurred in the history.
+        note_token = self.dropout(self.content_proj(notes_input))
+        query_token = self.query_norm(self.variable_embedding).view(
+            1, n, self.hidden
+        ).expand(b, -1, -1)
+        query = self.query_proj(query_token).view(
+            b, n, self.n_heads, self.head_dim
         )
-        weight_mass = gaussian_weight.sum(dim=-1)
-        text_grid = numerator / (1.0 + weight_mass.unsqueeze(-1))
+        key = self.key_proj(note_token).view(b, k, self.n_heads, self.head_dim)
+        value = self.value_proj(note_token).view(b, k, self.n_heads, self.head_dim)
+        scores = torch.einsum("bnhd,bkhd->bnhk", query, key)
+        scores = scores / math.sqrt(self.head_dim)
+
+        # Softmax is over variables, not reports. Therefore one report still
+        # receives C distinct allocation weights instead of weight 1 for every
+        # variable. Padded reports are removed after normalization.
+        attention = torch.softmax(scores.float(), dim=1)
+        attention = attention * note_mask.view(b, 1, 1, k).float()
+        context = torch.einsum(
+            "bnhk,bqk,bkhd->bnqhd",
+            attention.to(value.dtype),
+            time_weight.to(value.dtype),
+            value,
+        )
+        note_count = note_mask.sum(dim=1)
+        context = context / note_count.clamp_min(1).view(
+            b, 1, 1, 1, 1
+        ).to(context.dtype)
+        context = context.reshape(b, n, q, self.hidden)
+
+        # Direct feature fusion: no learned post-context gate and no warmup.
+        update_grid = self.context_out(context)
         patient_has_text = note_mask.any(dim=1)
-        text_grid = text_grid * patient_has_text.view(b, 1, 1).to(
-            text_grid.dtype
+        grid_has_text = patient_has_text.view(b, 1).expand(b, q)
+        update_grid = update_grid * grid_has_text.view(b, 1, q, 1).to(
+            update_grid.dtype
         )
+        update = F.pad(update_grid.permute(0, 3, 1, 2), (1, 0, 0, 0))
 
         with torch.no_grad():
-            note_count = note_mask.sum(dim=1)
-            grid_has_text = weight_mass > 1e-3
-            valid_weight = note_mask.view(b, 1, k).expand(b, q, k)
-            centered_text = text_grid - text_grid.mean(dim=1, keepdim=True)
-            text_temporal_variation = centered_text[
-                patient_has_text
-            ].square().mean().sqrt()
+            attention_mean = attention.mean(dim=2)  # (B, N, K)
+            attention_grid = attention_mean.unsqueeze(2).expand(b, n, q, k)
+            membership = note_mask.view(b, k, 1).expand(b, k, q)
+            valid_query = grid_has_text.view(b, 1, q).expand(b, n, q)
+            if note_mask.any():
+                entropy = -(
+                    attention_mean.clamp_min(1e-8).log() * attention_mean
+                ).sum(dim=1) / math.log(self.num_nodes)
+                attention_entropy = entropy[note_mask].mean()
+                attention_max = attention_mean.max(dim=1).values[
+                    note_mask
+                ].mean()
+                variable_usage = (
+                    attention_mean * note_mask.view(b, 1, k)
+                ).sum(dim=(0, 2)) / note_mask.sum().to(attention_mean.dtype)
+                uniform = torch.full_like(
+                    variable_usage, 1.0 / self.num_nodes
+                )
+                variable_imbalance = self.num_nodes * (
+                    variable_usage - uniform
+                ).square().sum()
+                time_valid = note_mask.view(b, 1, k).expand(b, q, k)
+                time_weight_mean = time_weight[time_valid].mean()
+                time_weight_max = time_weight[time_valid].max()
+            else:
+                attention_entropy = None
+                attention_max = None
+                variable_imbalance = None
+                time_weight_mean = None
+                time_weight_max = None
             multi_note_fraction = (note_count[patient_has_text] > 1).to(
                 torch.float32
             ).mean()
-            background_rms = text_grid[patient_has_text].square().mean().sqrt()
-            gaussian_weight_mean = gaussian_weight[valid_weight].mean()
-            gaussian_weight_max = gaussian_weight[valid_weight].max()
-
-            self.last_relevance = None
-            self.last_membership = None
-            self.last_text_temporal_variation = text_temporal_variation.detach()
+            if valid_query.any():
+                context_rms = context[valid_query].square().mean().sqrt()
+                update_abs_mean = update_grid[valid_query].abs().mean()
+            else:
+                context_rms = context.new_zeros(())
+                update_abs_mean = context.new_zeros(())
+            # Keep the grid expansion for compatibility with per-variable
+            # evaluation. Semantic allocation is constant over grid time; the
+            # separate Gaussian supplies the temporal weight.
+            self.last_attention = attention_grid.detach()
+            self.last_relevance = self.last_attention
+            self.last_membership = membership.detach()
+            self.last_attention_entropy = (
+                attention_entropy.detach()
+                if torch.is_tensor(attention_entropy)
+                else None
+            )
+            self.last_attention_max = (
+                attention_max.detach()
+                if torch.is_tensor(attention_max)
+                else None
+            )
+            self.last_variable_attention_imbalance = (
+                variable_imbalance.detach()
+                if torch.is_tensor(variable_imbalance)
+                else None
+            )
             self.last_multi_note_patient_fraction = multi_note_fraction.detach()
-            self.last_background_rms = background_rms.detach()
-            self.last_gaussian_weight_mean = gaussian_weight_mean.detach()
-            self.last_gaussian_weight_max = gaussian_weight_max.detach()
+            self.last_time_weight_mean = (
+                time_weight_mean.detach()
+                if torch.is_tensor(time_weight_mean)
+                else None
+            )
+            self.last_time_weight_max = (
+                time_weight_max.detach()
+                if torch.is_tensor(time_weight_max)
+                else None
+            )
+            self.last_context_rms = context_rms.detach()
             self.last_grid_has_text = grid_has_text.detach()
-            self.last_grid_weight_mass = weight_mass.detach()
+            self.last_grid_note_count = note_count.view(b, 1).expand(b, q).detach()
             self.last_note_count = note_count.detach()
             nearest_grid = time_delta.abs().argmin(dim=1)
             self.last_note_grid_index = nearest_grid.masked_fill(
                 ~note_mask, -1
             ).detach()
+            self.last_update_abs_mean = update_abs_mean.detach()
 
-        return text_grid.permute(0, 2, 1).unsqueeze(2)
+        return numeric_features + update
 
 
-# ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
 # MTGNN-style backbone (encoder mode: pools to a per-node hidden vector
 # instead of directly emitting a fixed prediction horizon)
 # ─────────────────────────────────────────────────────────────────────────
@@ -361,41 +495,13 @@ class MixProp(nn.Module):
         self.project = nn.Conv2d(channels * (depth + 1), channels, 1)
         self.dropout = nn.Dropout(dropout)
 
-        self.last_text_message_ratio = None
-
-    def forward(self, x, adjacency, text_edge):
-        # x: (B, F, C+1, M); adjacency: (C, C); text_edge: (C,)
-        num_nodes = adjacency.shape[0]
-        if x.shape[2] != num_nodes + 1:
-            raise ValueError(
-                "MixProp expects C numerical nodes followed by one text node"
-            )
-        if text_edge.shape != (num_nodes,):
-            raise ValueError(
-                f"MixProp expected {num_nodes} text edges, got {tuple(text_edge.shape)}"
-            )
-
-        numeric_x = x[:, :, :num_nodes]
-        text_x = x[:, :, num_nodes:]
+    def forward(self, x, adjacency):
+        # x (B, F, N, M) ; adjacency (N, N)
         states = [x]
-        numeric_h = numeric_x
+        h = x
         for _ in range(self.depth):
-            numeric_message = torch.einsum(
-                "ij,bcjt->bcit", adjacency, numeric_h
-            )
-            text_message = (
-                text_edge.view(1, 1, num_nodes, 1) * text_x
-            )
-            numeric_h = self.alpha * numeric_x + (1 - self.alpha) * (
-                numeric_message + text_message
-            )
-            states.append(torch.cat([numeric_h, text_x], dim=2))
-
-        numeric_strength = numeric_message.detach().abs().mean(dim=(0, 1, 3))
-        text_strength = text_message.detach().abs().mean(dim=(0, 1, 3))
-        self.last_text_message_ratio = text_strength / (
-            numeric_strength + 1e-8
-        )
+            h = self.alpha * x + (1 - self.alpha) * torch.einsum("ij,bcjt->bcit", adjacency, h)
+            states.append(h)
         return self.dropout(self.project(torch.cat(states, dim=1)))
 
 
@@ -419,19 +525,8 @@ class MTGNNEncoder(nn.Module):
     ):
         super().__init__()
         self.seq_length = seq_length
-        self.num_numeric_nodes = num_nodes
         self.start = nn.Conv2d(in_channels, hidden, 1)
         self.graph = GraphConstructor(num_nodes, subgraph_size, node_dim=node_dim)
-        # Text is a background source, not a competitor in the numerical TopK
-        # graph. A separate sigmoid edge gives every variable a differentiable
-        # route to the text node while allowing training to suppress it.
-        initial_text_edge = 0.1
-        initial_text_logit = math.log(
-            initial_text_edge / (1.0 - initial_text_edge)
-        )
-        self.text_edge_logits = nn.Parameter(
-            torch.full((num_nodes,), initial_text_logit)
-        )
         self.blocks = nn.ModuleList()
         for _ in range(layers):
             self.blocks.append(
@@ -445,60 +540,18 @@ class MTGNNEncoder(nn.Module):
             )
         self.dropout = nn.Dropout(dropout)
         self.temporal_agg = nn.Linear(hidden * seq_length, hid_dim)
-        self.last_text_edge = None
-        self.last_text_message_ratio = None
 
     def forward(self, x):
-        # x: (B, C_in, C+1, T), with the text node last.
+        # x: (B, C_in, N, T)
         if x.shape[-1] != self.seq_length:
             raise ValueError(f"MTGNNEncoder expected sequence length {self.seq_length}, got {x.shape[-1]}")
-        expected_nodes = self.num_numeric_nodes + 1
-        if x.shape[2] != expected_nodes:
-            raise ValueError(
-                f"MTGNNEncoder expected {expected_nodes} nodes, got {x.shape[2]}"
-            )
         adjacency = self.graph()
-        text_edge = torch.sigmoid(self.text_edge_logits)
-        # Convolution biases must not turn an absent text input into a phantom
-        # message. Keep the text state exactly zero for patients without notes.
-        text_present = (
-            x[:, :, self.num_numeric_nodes :, :]
-            .abs()
-            .sum(dim=(1, 2, 3), keepdim=True)
-            .gt(0)
-            .to(x.dtype)
-        )
         h = self.start(x)
-        h = torch.cat(
-            [
-                h[:, :, : self.num_numeric_nodes],
-                h[:, :, self.num_numeric_nodes :] * text_present,
-            ],
-            dim=2,
-        )
-        message_ratios = []
         for block in self.blocks:
             residual = h
             h = torch.tanh(block["temporal"](h))
-            h = torch.cat(
-                [
-                    h[:, :, : self.num_numeric_nodes],
-                    h[:, :, self.num_numeric_nodes :] * text_present,
-                ],
-                dim=2,
-            )
-            h = block["graph"](h, adjacency, text_edge)
-            message_ratios.append(block["graph"].last_text_message_ratio)
+            h = block["graph"](h, adjacency)
             h = block["norm"](h + residual)
-            h = torch.cat(
-                [
-                    h[:, :, : self.num_numeric_nodes],
-                    h[:, :, self.num_numeric_nodes :] * text_present,
-                ],
-                dim=2,
-            )
-        self.last_text_edge = text_edge.detach()
-        self.last_text_message_ratio = torch.stack(message_ratios).mean(dim=0)
         h = self.dropout(F.relu(h))  # (B, hidden, N, T)
         b, hd, n, t = h.shape
         h = h.permute(0, 2, 1, 3).reshape(b, n, hd * t)
@@ -526,7 +579,7 @@ class LearnableTE(nn.Module):
 
 
 class GPINet(nn.Module):
-    """GP -> GH numerical nodes + Gaussian text node -> MTGNN -> decoder."""
+    """GP -> GH -> optional semantic-time text -> MTGNN -> query decoder."""
 
     def __init__(self, args, supports=None, dropout=0):
         super().__init__()
@@ -560,7 +613,7 @@ class GPINet(nn.Module):
             self.hid_dim, k=int(getattr(args, "gpinet_gh_k", 3))
         )
         self.backbone = MTGNNEncoder(
-            self.N,  # C numerical variables; text uses a separate edge
+            self.N,
             in_channels=self.hid_dim,
             seq_length=n_query + 1,  # +1 for the zero-padding column
             hid_dim=self.hid_dim,
@@ -595,14 +648,17 @@ class GPINet(nn.Module):
                 torch.random.default_generator.manual_seed(
                     int(getattr(args, "seed", 0)) + 104729
                 )
-                self.text_grid_fusion = GaussianTextBackground(
+                self.text_grid_fusion = HistoricalGridTextFusion(
                     d_txt=int(args.d_txt),
                     hidden=self.hid_dim,
+                    num_nodes=self.N,
                     t_query=t_query,
                     history_window=float(args.history),
                     total_window=float(args.history + args.pred_window),
-                    sigma_hours=float(
-                        getattr(args, "gpinet_text_time_sigma_hours", 3.0)
+                    n_heads=int(getattr(args, "n_heads_fusion", 1)),
+                    dropout=float(args.dropout),
+                    time_sigma_hours=float(
+                        getattr(args, "gpinet_text_time_sigma_hours", 4.0)
                     ),
                 )
         # populated on each forecasting() call for optional external logging
@@ -643,34 +699,21 @@ class GPINet(nn.Module):
         self.last_mll = mll
         self.last_valid_pairs = valid_pairs
 
-        # GH produces C regular numerical nodes. Text remains an independent
-        # (C+1)-th node so MTGNN, rather than a pre-backbone cross-attention,
-        # learns whether and how it propagates to numerical variables.
-        numeric_nodes = self.fusion(
-            mean.unsqueeze(1), std.unsqueeze(1)
-        )  # (B, hid_dim, N, Q)
+        gp_input = torch.stack([mean, std], dim=1)  # (B, 2, N, Q)
+        gp_input = F.pad(gp_input, (1, 0, 0, 0))  # (B, 2, N, Q+1)
+        fused = self.fusion(gp_input[:, 0:1], gp_input[:, 1:2])  # (B, hid_dim, N, Q+1)
 
-        text_node = numeric_nodes.new_zeros(
-            (B, self.hid_dim, 1, numeric_nodes.shape[-1])
-        )
         if notes_input is not None or tau is not None:
             if self.text_grid_fusion is None:
                 raise RuntimeError(
-                    "GPINet received native text inputs, but its text background "
+                    "GPINet received native text inputs, but native text fusion "
                     "was not enabled with --enable_text --use_text_embeddings."
                 )
             if notes_input is None or tau is None:
                 raise ValueError("notes_input and tau must be provided together")
-            text_node = self.text_grid_fusion(numeric_nodes, notes_input, tau)
+            fused = self.text_grid_fusion(fused, notes_input, tau)
 
-        graph_nodes = torch.cat([numeric_nodes, text_node], dim=2)
-        graph_nodes = F.pad(
-            graph_nodes, (1, 0, 0, 0)
-        )  # (B, hid_dim, N+1, Q+1)
-        all_node_states = self.backbone(
-            graph_nodes
-        )  # (B, N+1, hid_dim)
-        h = all_node_states[:, :N]  # text node is context, never a target
+        h = self.backbone(fused)  # (B, N, hid_dim)
 
         Lp = time_steps_to_predict.shape[1]
         h_exp = h.unsqueeze(2).expand(B, N, Lp, self.hid_dim)
