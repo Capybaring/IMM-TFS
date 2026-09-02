@@ -214,9 +214,13 @@ class MMF_VarTime_SlotGate(nn.Module):
         text_mask = has_text.view(B, 1, 1).to(Y_ts.dtype)
 
         E_slots = E_txt.reshape(B, T, self.semantic_slots, self.slot_dim)
-        slot_rms = (
-            E_slots.float().square().mean(dim=-1, keepdim=True).sqrt()
-        ).to(E_slots.dtype)
+        # Soft routing can produce an exactly empty or numerically underflowed
+        # slot.  sqrt(x) has a singular derivative at x=0, which makes the
+        # forward value finite but sends NaN gradients back into TTF.  Clamp
+        # the power before sqrt so empty slots remain zero after LayerNorm
+        # multiplication while their backward gradient stays finite.
+        slot_power = E_slots.float().square().mean(dim=-1, keepdim=True)
+        slot_rms = slot_power.clamp_min(1e-8).sqrt().to(E_slots.dtype)
         E_slots = self.slot_norm(E_slots) * slot_rms
 
         # Detach only the residual-query input.  The explicit addition at the
