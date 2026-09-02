@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Command-line interface: only mode, total-subject count, and model seed.
 MODE="uni"
-TOTAL_N=4000
+TOTAL_N=1000
 MODEL_SEED=1
 
 # Edit the remaining experiment settings directly here.
@@ -16,11 +16,21 @@ LOADER_SEED=314159
 USE_AMP=0
 OUTPUT_DIR="logs/gpinet_runs"
 
-GP_QUERY_POINTS=24
+TTF_MODULE="TTF_SemTime_Slots"
+MMF_MODULE="MMF_VarTime_SlotGate"
 TEXT_HEADS=1
-TEXT_DIM=768
-TEXT_TIME_SIGMA_HOURS=4.0
+TEXT_DIM=128
+SEMANTIC_SLOTS=2
+RECENCY_SIGMA=0.25
+SEMANTIC_TIME_GATE_BIAS=-1.0
+ABSOLUTE_RECENCY_FLOOR=0.1
+MMF_SLOT_ATTN_DIM=128
+MMF_SLOT_GATE_BIAS=0.0
+MMF_DELTA_INIT_STD=0.01
+FUSION_GATE_WARMUP_EPOCHS=5
+FUSION_GATE_WARMUP_VALUE=0.5
 FUSION_LR_MULTIPLIER=2.0
+KAPPA=0.1
 
 usage() {
     cat <<'EOF'
@@ -123,7 +133,6 @@ cmd=(
     --node_dim 10
     --hid_dim 64
     --dropout 0.3
-    --gpinet_query_points "$GP_QUERY_POINTS"
     --num "$TOTAL_N"
 )
 
@@ -137,8 +146,19 @@ if [[ "$MODE" == "multi" ]]; then
         --max_length 512
         --n_heads_fusion "$TEXT_HEADS"
         --d_txt "$TEXT_DIM"
-        --gpinet_text_time_sigma_hours "$TEXT_TIME_SIGMA_HOURS"
+        --TTF_module "$TTF_MODULE"
+        --MMF_module "$MMF_MODULE"
+        --semantic_slots "$SEMANTIC_SLOTS"
+        --recency_sigma "$RECENCY_SIGMA"
+        --semantic_time_gate_bias "$SEMANTIC_TIME_GATE_BIAS"
+        --absolute_recency_floor "$ABSOLUTE_RECENCY_FLOOR"
+        --mmf_slot_attn_dim "$MMF_SLOT_ATTN_DIM"
+        --mmf_slot_gate_bias "$MMF_SLOT_GATE_BIAS"
+        --mmf_delta_init_std "$MMF_DELTA_INIT_STD"
+        --fusion_gate_warmup_epochs "$FUSION_GATE_WARMUP_EPOCHS"
+        --fusion_gate_warmup_value "$FUSION_GATE_WARMUP_VALUE"
         --fusion_lr_multiplier "$FUSION_LR_MULTIPLIER"
+        --kappa "$KAPPA"
     )
 fi
 [[ "$USE_AMP" -eq 1 ]] && cmd+=(--use_amp)
