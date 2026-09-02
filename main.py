@@ -710,10 +710,7 @@ def get_args_from_parser() -> argparse.Namespace:
         "--n_heads_fusion",
         type=int,
         default=1,
-        help=(
-            "Number of attention heads used by external Fusion modules; "
-            "GPINet's Gaussian text-background route does not use attention"
-        ),
+        help="Number of attention heads for Fusion modules",
     )
     parser.add_argument(
         "--gpinet_query_points",
@@ -721,16 +718,16 @@ def get_args_from_parser() -> argparse.Namespace:
         default=24,
         help=(
             "Number of historical GP grid points used by GPINet. Native "
-            "Gaussian text alignment uses this same reference grid."
+            "text reports are diffused over this same grid by time distance."
         ),
     )
     parser.add_argument(
         "--gpinet_text_time_sigma_hours",
         type=float,
-        default=3.0,
+        default=4.0,
         help=(
-            "Gaussian bandwidth in hours for mapping irregular reports to "
-            "the GPINet text-background node"
+            "Gaussian time-distance bandwidth in hours for spreading each "
+            "historical report over the GPINet history grid"
         ),
     )
     parser.add_argument(
@@ -1133,10 +1130,10 @@ def trainable(
     model_class = _load_model_class(args.model)
     model = model_class(args).to(args.device)
 
-    # GPINet with pre-computed embeddings owns its text path: a fixed Gaussian
-    # kernel maps irregular reports to one regular text-background node, which
-    # is appended to the numerical nodes before MTGNN. Other models (and
-    # raw-text GPINet runs) keep the benchmark's external FusionModel.
+    # GPINet with pre-computed embeddings owns its text path: reports are
+    # allocated over variables, diffused over the historical grid by time
+    # distance, and fused before MTGNN. Other models (and raw-text GPINet
+    # runs) keep the benchmark's external FusionModel.
     native_text_fusion = bool(
         args.enable_text and getattr(model, "native_text_enabled", False)
     )
@@ -1172,23 +1169,18 @@ def trainable(
     logger.info(args)
     if native_text_fusion:
         logger.info(
-            "Text route: GPINet Gaussian alignment + MTGNN background node"
+            "Text route: GPINet variable allocation + Gaussian time diffusion"
         )
     elif fusion is not None:
         logger.info("Text route: external TTF/MMF prediction fusion")
 
     # Keep the text branch on the same optimizer protocol as external TTF/MMF:
     # 2x learning rate, no weight decay, and independent gradient clipping.
-    native_text_parameters = []
-    if native_text_fusion:
-        native_text_parameters.extend(model.text_grid_fusion.parameters())
-        text_edge_logits = getattr(
-            getattr(model, "backbone", None),
-            "text_edge_logits",
-            None,
-        )
-        if isinstance(text_edge_logits, torch.nn.Parameter):
-            native_text_parameters.append(text_edge_logits)
+    native_text_parameters = (
+        list(model.text_grid_fusion.parameters())
+        if native_text_fusion
+        else []
+    )
     native_text_parameter_ids = {id(p) for p in native_text_parameters}
     model_parameters = [
         p for p in model.parameters() if id(p) not in native_text_parameter_ids
@@ -1233,8 +1225,8 @@ def trainable(
             return
         if native_text_fusion:
             text_module = model.text_grid_fusion
-            delta_out = text_module.text_proj
-            prefix = "GPINetTextBackgroundBootstrap"
+            delta_out = text_module.context_out
+            prefix = "GPINetTextBootstrap"
         else:
             mmf = getattr(fusion, "mmf", None)
             delta_out = getattr(mmf, "delta_out", None)
@@ -1439,34 +1431,29 @@ def trainable(
                     val_res["mae"],
                 )
             )
-            if native_text_fusion:
+            if (
+                native_text_fusion
+                and "text_variable_allocation_mean" in val_res
+            ):
                 logger.info(
-                    "Val - Gaussian weight mean/max, text temporal "
-                    "variation, background RMS, graph edge, text/numeric "
-                    "message ratio: {:.5f}, {:.5f}, {:.5f}, {:.5f}, "
+                    "Val - Variable attention entropy/max, time weight, "
+                    "context RMS, update abs: {:.5f}, {:.5f}, {:.5f}, "
                     "{:.5f}, {:.5f}".format(
                         val_res.get(
-                            "gpinet_text_gaussian_weight_mean",
+                            "gpinet_text_variable_attention_entropy",
                             float("nan"),
                         ),
                         val_res.get(
-                            "gpinet_text_gaussian_weight_max",
+                            "gpinet_text_variable_attention_max",
                             float("nan"),
                         ),
                         val_res.get(
-                            "gpinet_text_background_temporal_variation",
+                            "gpinet_text_time_weight_mean",
                             float("nan"),
                         ),
+                        val_res.get("gpinet_text_context_rms", float("nan")),
                         val_res.get(
-                            "gpinet_text_background_rms",
-                            float("nan"),
-                        ),
-                        val_res.get(
-                            "gpinet_text_graph_edge_mean",
-                            float("nan"),
-                        ),
-                        val_res.get(
-                            "gpinet_text_message_ratio_mean",
+                            "gpinet_text_update_abs_mean",
                             float("nan"),
                         ),
                     )
