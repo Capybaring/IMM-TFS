@@ -243,10 +243,14 @@ class TTF_SemTime_Slots(nn.Module):
         valid_count = note_mask.sum(dim=-1, keepdim=True).float()
         slot_mass = raw_slot_mass / valid_count.clamp_min(1.0)
 
+        # A nearly unused soft slot can have an arbitrarily small mass.  Using
+        # 1e-8 as its normalization floor amplifies backward gradients by up to
+        # 1e8 and can corrupt the fusion parameters.  Keep the soft allocation
+        # unchanged while bounding only the normalization denominator.
+        stable_slot_mass = raw_slot_mass.clamp_min(1e-4)
+
         # Within each slot, normalize only over its assigned real notes.
-        semantic_weights = slot_assignment / raw_slot_mass.unsqueeze(-1).clamp_min(
-            1e-8
-        )
+        semantic_weights = slot_assignment / stable_slot_mass.unsqueeze(-1)
 
         consistency_vectors = self.consistency_proj(V)
         consistency = self._slot_consistency(
@@ -322,7 +326,7 @@ class TTF_SemTime_Slots(nn.Module):
         recency_numer = (
             slot_assignment[:, :, None, :] * temporal_kernel
         ).sum(dim=-1)
-        recency_denom = raw_slot_mass[:, :, None].clamp_min(1e-8)
+        recency_denom = stable_slot_mass[:, :, None]
         absolute_recency_strength = recency_numer / recency_denom
         absolute_recency_strength = (
             self.absolute_recency_floor
