@@ -1240,6 +1240,12 @@ def trainable(
 
     register_forward_nan_checks(model)
     register_grad_nan_checks(model)
+    if fusion is not None:
+        # TTF/MMF is optimized separately from the forecasting backbone, so it
+        # needs its own hooks to identify the first module or parameter that
+        # becomes non-finite.
+        register_forward_nan_checks(fusion)
+        register_grad_nan_checks(fusion)
 
     scaler = GradScaler() if args.use_amp else None
 
