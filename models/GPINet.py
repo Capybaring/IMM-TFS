@@ -1,4 +1,4 @@
-"""GPINet: GP interpolation + Gauss-Hermite fusion + MTGNN-style backbone.
+"""GPINet: GP interpolation + time-aligned text + MTGNN-style backbone.
 
 Ported to the IMM-TSF benchmark interface. Unlike the standalone version in
 the project root (models/gpinet_mm.py), this file:
@@ -7,13 +7,12 @@ the project root (models/gpinet_mm.py), this file:
   - implements the generic `forecasting(time_steps_to_predict, X,
     truth_time_steps, mask)` contract shared by every model in this repo
     (see models/tPatchGNN.py, models/CRU.py), so it plugs into the same
-    training loop, evaluation code, and text FusionModel as every other
-    baseline.
-  - has NO built-in text fusion. Multimodality is handled uniformly for all
-    models by fusions/FusionModel.py, applied on top of this model's
-    numeric-only output (Y_ts) in main.py's training loop. This is required
-    to make the GPINet-vs-tPatchGNN comparison isolate the backbone as the
-    only variable.
+    training loop and evaluation code as every other baseline.
+  - optionally aligns pre-computed report embeddings to the historical GP
+    grid and fuses them with Gauss-Hermite features *before* the MTGNN
+    temporal/graph blocks. Reports are assigned to the first grid point at
+    or after their timestamp, so future text never leaks into an earlier
+    state and empty grid points receive an exactly-zero text update.
   - queries the decoder at the batch's actual `time_steps_to_predict`
     (variable, padded, continuous) instead of a fixed internal grid, since
     IMM-TSF's standard collate does not guarantee a fixed prediction length
@@ -143,6 +142,328 @@ class GaussHermiteFusionModule(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# Independent variable-time text gating and feature residual fusion
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class HistoricalGridTextFusion(nn.Module):
+    """Inject independently gated timestamped reports before MTGNN.
+
+    A query built from the local Gauss-Hermite state and variable identity is
+    matched with each report independently through a sigmoid gate. Reports do
+    not compete through softmax, so all, some, or none of them may affect a
+    variable. The gate is multiplied by a Gaussian timestamp weight and the
+    resulting text feature is added to the regular GP grid before MTGNN.
+    """
+
+    def __init__(
+        self,
+        d_txt,
+        hidden,
+        num_nodes,
+        t_query,
+        history_window,
+        total_window,
+        n_heads=1,
+        dropout=0.1,
+        time_sigma_hours=4.0,
+    ):
+        super().__init__()
+        if n_heads < 1:
+            raise ValueError("n_heads_fusion must be >= 1")
+        if hidden % n_heads != 0:
+            raise ValueError(
+                f"GPINet text hidden size {hidden} must be divisible by "
+                f"n_heads_fusion={n_heads}"
+            )
+        if total_window <= 0 or history_window <= 0:
+            raise ValueError("history and history + pred_window must be positive")
+        if history_window > total_window:
+            raise ValueError("history cannot exceed history + pred_window")
+        if time_sigma_hours <= 0:
+            raise ValueError("GPINet text time sigma must be positive")
+
+        self.hidden = int(hidden)
+        self.num_nodes = int(num_nodes)
+        self.n_heads = int(n_heads)
+        self.head_dim = self.hidden // self.n_heads
+        self.total_window = float(total_window)
+        self.history_end = float(history_window) / self.total_window
+        self.time_sigma_hours = float(time_sigma_hours)
+        self.register_buffer("t_query", t_query.detach().float().clone())
+
+        self.content_proj = nn.Sequential(
+            nn.Linear(int(d_txt), self.hidden),
+            nn.GELU(),
+            nn.LayerNorm(self.hidden),
+        )
+        self.variable_embedding = nn.Parameter(
+            torch.randn(self.num_nodes, self.hidden) * 0.02
+        )
+        self.query_norm = nn.LayerNorm(self.hidden)
+        self.key_proj = nn.Linear(self.hidden, self.hidden)
+        self.value_proj = nn.Linear(self.hidden, self.hidden)
+        self.query_proj = nn.Linear(self.hidden, self.hidden)
+        # Start conservatively at approximately 0.1 relevance while allowing
+        # every variable to learn its own baseline willingness to use text.
+        initial_gate_probability = 0.1
+        initial_gate_logit = math.log(
+            initial_gate_probability / (1.0 - initial_gate_probability)
+        )
+        self.gate_bias = nn.Parameter(
+            torch.full((self.num_nodes,), initial_gate_logit)
+        )
+        # Bias-free output projection preserves the exact zero update for an
+        # empty grid.
+        self.context_out = nn.Linear(self.hidden, self.hidden, bias=False)
+        self.dropout = nn.Dropout(float(dropout))
+
+        # Detached diagnostics from the most recent forward pass.
+        self.last_relevance = None
+        self.last_membership = None
+        self.last_gate = None
+        self.last_gate_mean = None
+        self.last_gate_max = None
+        self.last_variable_gate_spread = None
+        self.last_multi_note_patient_fraction = None
+        self.last_time_weight_mean = None
+        self.last_time_weight_max = None
+        self.last_context_rms = None
+        self.last_grid_has_text = None
+        self.last_grid_note_count = None
+        self.last_note_count = None
+        self.last_note_grid_index = None
+        self.last_update_abs_mean = None
+
+    def _empty_update(self, numeric_features, batch_size, num_notes=0):
+        q = self.t_query.numel()
+        update = torch.zeros_like(numeric_features)
+        relevance = numeric_features.new_zeros(
+            (batch_size, self.num_nodes, q, num_notes)
+        )
+        self.last_relevance = relevance
+        self.last_gate = relevance
+        self.last_gate_mean = None
+        self.last_gate_max = None
+        self.last_variable_gate_spread = None
+        self.last_multi_note_patient_fraction = None
+        self.last_time_weight_mean = None
+        self.last_time_weight_max = None
+        self.last_membership = torch.zeros(
+            batch_size,
+            num_notes,
+            q,
+            dtype=torch.bool,
+            device=numeric_features.device,
+        )
+        self.last_context_rms = None
+        self.last_grid_has_text = torch.zeros(
+            batch_size, q, dtype=torch.bool, device=numeric_features.device
+        )
+        self.last_grid_note_count = numeric_features.new_zeros((batch_size, q))
+        self.last_note_count = numeric_features.new_zeros((batch_size,))
+        self.last_note_grid_index = torch.full(
+            (batch_size, num_notes),
+            -1,
+            dtype=torch.long,
+            device=numeric_features.device,
+        )
+        self.last_update_abs_mean = None
+        return update
+
+    def forward(self, numeric_features, notes_input, tau_raw):
+        # numeric_features: (B, H, N, Q+1), with a zero-padding first column.
+        if notes_input is None or tau_raw is None:
+            return numeric_features
+        if notes_input.dim() != 3:
+            raise ValueError(
+                "GPINet native text fusion expects pre-computed embeddings "
+                "with shape (B, K, d_txt)"
+            )
+        if tau_raw.dim() != 2:
+            raise ValueError("tau_raw must have shape (B, K)")
+
+        b, _, n, padded_q = numeric_features.shape
+        if n != self.num_nodes:
+            raise ValueError(f"Expected {self.num_nodes} variables, got {n}")
+        q = self.t_query.numel()
+        if padded_q != q + 1:
+            raise ValueError(
+                f"Expected {q + 1} GP columns (including padding), got {padded_q}"
+            )
+        if notes_input.shape[:2] != tau_raw.shape:
+            raise ValueError(
+                "notes_input and tau_raw must agree on batch and report dimensions"
+            )
+        k = notes_input.shape[1]
+        if k == 0:
+            return numeric_features + self._empty_update(numeric_features, b, 0)
+        expected_d_txt = self.content_proj[0].in_features
+        if notes_input.shape[-1] != expected_d_txt:
+            raise ValueError(
+                f"GPINet expected text embedding size {expected_d_txt}, "
+                f"got {notes_input.shape[-1]}; set --d_txt to match the "
+                "pre-computed embedding file"
+            )
+
+        notes_input = notes_input.to(
+            device=numeric_features.device, dtype=numeric_features.dtype
+        )
+        tau_raw = tau_raw.to(
+            device=numeric_features.device, dtype=numeric_features.dtype
+        )
+        note_mask = torch.isfinite(notes_input).all(dim=-1)
+        note_mask = note_mask & (notes_input.abs().sum(dim=-1) > 0)
+        tau_norm = tau_raw / self.total_window
+        # The original GPINet grid represents [0, history) (0..23 h for the
+        # 24 h MIMIC history), so the final query is one step before the true
+        # history boundary. Use the boundary rather than t_query[-1] when
+        # validating reports, otherwise notes from the final hour are lost.
+        history_end = tau_norm.new_tensor(self.history_end)
+        note_mask = (
+            note_mask
+            & torch.isfinite(tau_norm)
+            & (tau_norm >= 0)
+            & (tau_norm <= history_end + 1e-7)
+        )
+        if not note_mask.any():
+            return numeric_features + self._empty_update(numeric_features, b, k)
+
+        notes_input = notes_input.masked_fill(~note_mask.unsqueeze(-1), 0)
+        tau_norm = tau_norm.masked_fill(~note_mask, 0)
+        tau_hours = tau_raw.masked_fill(~note_mask, 0)
+
+        # Each report influences every historical grid point through a
+        # Gaussian of its exact timestamp. This is a weighted diffusion, not
+        # uniform replication over the 24-hour grid.
+        grid_times = self.t_query.to(
+            device=numeric_features.device, dtype=numeric_features.dtype
+        )
+        grid_hours = grid_times * self.total_window
+        time_delta = grid_hours.view(1, q, 1).float() - tau_hours.view(
+            b, 1, k
+        ).float()
+        time_weight = torch.exp(
+            -0.5 * (time_delta / self.time_sigma_hours).square()
+        )
+        time_weight = time_weight * note_mask.view(b, 1, k).float()
+
+        # Each report keeps a single semantic key/value.  The query additionally
+        # uses the local GP/GH state, so relevance may differ by patient,
+        # variable and grid time without changing MTGNN itself.
+        note_token = self.dropout(self.content_proj(notes_input))
+        numeric_grid = numeric_features[..., 1:].permute(0, 2, 3, 1)
+        variable_token = self.variable_embedding.view(1, n, 1, self.hidden)
+        query_token = self.query_norm(numeric_grid + variable_token)
+        query = self.query_proj(query_token).view(
+            b, n, q, self.n_heads, self.head_dim
+        )
+        key = self.key_proj(note_token).view(b, k, self.n_heads, self.head_dim)
+        value = self.value_proj(note_token).view(b, k, self.n_heads, self.head_dim)
+        scores = torch.einsum("bnqhd,bkhd->bnqhk", query, key)
+        scores = scores / math.sqrt(self.head_dim)
+        scores = scores + self.gate_bias.view(1, n, 1, 1, 1)
+
+        # Independent sigmoid relevance: unlike softmax, no report is forced
+        # to enter a variable and multiple useful reports can all remain active.
+        gate = torch.sigmoid(scores.float())
+        gate = gate * note_mask.view(b, 1, 1, 1, k).float()
+        context = torch.einsum(
+            "bnqhk,bqk,bkhd->bnqhd",
+            gate.to(value.dtype),
+            time_weight.to(value.dtype),
+            value,
+        )
+        note_count = note_mask.sum(dim=1)
+        context = context / note_count.clamp_min(1).view(
+            b, 1, 1, 1, 1
+        ).to(context.dtype)
+        context = context.reshape(b, n, q, self.hidden)
+
+        # Direct feature fusion: no learned post-context gate and no warmup.
+        update_grid = self.context_out(context)
+        patient_has_text = note_mask.any(dim=1)
+        grid_has_text = patient_has_text.view(b, 1).expand(b, q)
+        update_grid = update_grid * grid_has_text.view(b, 1, q, 1).to(
+            update_grid.dtype
+        )
+        update = F.pad(update_grid.permute(0, 3, 1, 2), (1, 0, 0, 0))
+
+        with torch.no_grad():
+            gate_mean = gate.mean(dim=3)  # (B, N, Q, K)
+            membership = note_mask.view(b, k, 1).expand(b, k, q)
+            valid_query = grid_has_text.view(b, 1, q).expand(b, n, q)
+            if note_mask.any():
+                valid_gate = note_mask.view(b, 1, 1, k).expand(b, n, q, k)
+                gate_mean_value = gate_mean[valid_gate].mean()
+                gate_max_value = gate_mean[valid_gate].max()
+                variable_usage = (
+                    gate_mean * note_mask.view(b, 1, 1, k)
+                ).sum(dim=(0, 2, 3)) / (
+                    note_mask.sum().to(gate_mean.dtype) * q
+                )
+                variable_gate_spread = variable_usage.std(unbiased=False)
+                time_valid = note_mask.view(b, 1, k).expand(b, q, k)
+                time_weight_mean = time_weight[time_valid].mean()
+                time_weight_max = time_weight[time_valid].max()
+            else:
+                gate_mean_value = None
+                gate_max_value = None
+                variable_gate_spread = None
+                time_weight_mean = None
+                time_weight_max = None
+            multi_note_fraction = (note_count[patient_has_text] > 1).to(
+                torch.float32
+            ).mean()
+            if valid_query.any():
+                context_rms = context[valid_query].square().mean().sqrt()
+                update_abs_mean = update_grid[valid_query].abs().mean()
+            else:
+                context_rms = context.new_zeros(())
+                update_abs_mean = context.new_zeros(())
+            self.last_gate = gate_mean.detach()
+            self.last_relevance = self.last_gate
+            self.last_membership = membership.detach()
+            self.last_gate_mean = (
+                gate_mean_value.detach()
+                if torch.is_tensor(gate_mean_value)
+                else None
+            )
+            self.last_gate_max = (
+                gate_max_value.detach()
+                if torch.is_tensor(gate_max_value)
+                else None
+            )
+            self.last_variable_gate_spread = (
+                variable_gate_spread.detach()
+                if torch.is_tensor(variable_gate_spread)
+                else None
+            )
+            self.last_multi_note_patient_fraction = multi_note_fraction.detach()
+            self.last_time_weight_mean = (
+                time_weight_mean.detach()
+                if torch.is_tensor(time_weight_mean)
+                else None
+            )
+            self.last_time_weight_max = (
+                time_weight_max.detach()
+                if torch.is_tensor(time_weight_max)
+                else None
+            )
+            self.last_context_rms = context_rms.detach()
+            self.last_grid_has_text = grid_has_text.detach()
+            self.last_grid_note_count = note_count.view(b, 1).expand(b, q).detach()
+            self.last_note_count = note_count.detach()
+            nearest_grid = time_delta.abs().argmin(dim=1)
+            self.last_note_grid_index = nearest_grid.masked_fill(
+                ~note_mask, -1
+            ).detach()
+            self.last_update_abs_mean = update_abs_mean.detach()
+
+        return numeric_features + update
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # MTGNN-style backbone (encoder mode: pools to a per-node hidden vector
 # instead of directly emitting a fixed prediction horizon)
 # ─────────────────────────────────────────────────────────────────────────
@@ -256,10 +577,7 @@ class LearnableTE(nn.Module):
 
 
 class GPINet(nn.Module):
-    """GP interpolation -> Gauss-Hermite fusion -> MTGNN encoder -> per-query
-    decoder. Numeric-only; text fusion is applied externally via
-    fusions/FusionModel.py, same as every other model in this repo.
-    """
+    """GP -> GH -> optional gated text residual -> MTGNN -> query decoder."""
 
     def __init__(self, args, supports=None, dropout=0):
         super().__init__()
@@ -269,8 +587,15 @@ class GPINet(nn.Module):
         self.te_dim = args.te_dim
 
         history_frac = float(args.history) / float(args.history + args.pred_window)
-        n_query = int(getattr(args, "gpinet_query_points", 8))
-        t_query = torch.linspace(0.0, history_frac, n_query)
+        # Restore the original GPINet convention: Q defaults to the prediction
+        # horizon (24 for expanded MIMIC), with query points covering [0, H)
+        # rather than including the H=24 boundary.
+        n_query = int(getattr(args, "gpinet_query_points", 0)) or int(
+            args.pred_window
+        )
+        if n_query < 2:
+            raise ValueError("GPINet requires at least two historical query points")
+        t_query = torch.linspace(0.0, history_frac, n_query + 1)[:n_query]
 
         self.gp = BatchedGPInterpolator(
             self.N,
@@ -305,6 +630,35 @@ class GPINet(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(self.hid_dim, 1),
         )
+
+        # Build text-only parameters after every numeric parameter. fork_rng
+        # ensures enabling text cannot perturb numeric initialization under the
+        # same experiment seed, keeping uni-vs-multi comparisons fair.
+        self.native_text_enabled = bool(
+            getattr(args, "enable_text", False)
+            and getattr(args, "use_text_embeddings", False)
+        )
+        self.text_grid_fusion = None
+        if self.native_text_enabled:
+            # All modules are still constructed on CPU here. Seed only the
+            # CPU generator so unrelated CUDA streams are untouched.
+            with torch.random.fork_rng(devices=[]):
+                torch.random.default_generator.manual_seed(
+                    int(getattr(args, "seed", 0)) + 104729
+                )
+                self.text_grid_fusion = HistoricalGridTextFusion(
+                    d_txt=int(args.d_txt),
+                    hidden=self.hid_dim,
+                    num_nodes=self.N,
+                    t_query=t_query,
+                    history_window=float(args.history),
+                    total_window=float(args.history + args.pred_window),
+                    n_heads=int(getattr(args, "n_heads_fusion", 1)),
+                    dropout=float(args.dropout),
+                    time_sigma_hours=float(
+                        getattr(args, "gpinet_text_time_sigma_hours", 4.0)
+                    ),
+                )
         # populated on each forecasting() call for optional external logging
         self.last_mll = None
         self.last_valid_pairs = None
@@ -312,12 +666,22 @@ class GPINet(nn.Module):
     def get_hyperparams(self):
         return self.gp.get_hyperparams()
 
-    def forecasting(self, time_steps_to_predict, X, truth_time_steps, mask=None):
+    def forecasting(
+        self,
+        time_steps_to_predict,
+        X,
+        truth_time_steps,
+        mask=None,
+        notes_input=None,
+        tau=None,
+    ):
         """
         time_steps_to_predict: (B, Lp)        normalized query times in [0,1]
         X (observed_data):     (B, T_obs, N)
         truth_time_steps:      (B, T_obs)     shared time axis across variables
         mask (observed_mask):  (B, T_obs, N)
+        notes_input:           (B, K, d_txt)  padded report embeddings
+        tau:                   (B, K)         raw report times (dataset units)
         returns:                (B, Lp, N)
         """
         B, T_obs, N = X.shape
@@ -336,6 +700,16 @@ class GPINet(nn.Module):
         gp_input = torch.stack([mean, std], dim=1)  # (B, 2, N, Q)
         gp_input = F.pad(gp_input, (1, 0, 0, 0))  # (B, 2, N, Q+1)
         fused = self.fusion(gp_input[:, 0:1], gp_input[:, 1:2])  # (B, hid_dim, N, Q+1)
+
+        if notes_input is not None or tau is not None:
+            if self.text_grid_fusion is None:
+                raise RuntimeError(
+                    "GPINet received native text inputs, but native text fusion "
+                    "was not enabled with --enable_text --use_text_embeddings."
+                )
+            if notes_input is None or tau is None:
+                raise ValueError("notes_input and tau must be provided together")
+            fused = self.text_grid_fusion(fused, notes_input, tau)
 
         h = self.backbone(fused)  # (B, N, hid_dim)
 
