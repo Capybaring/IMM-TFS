@@ -1,0 +1,3 @@
+Codex push test — 2026-10-07
+
+This file verifies that Codex can commit and push to the IMM-TFS repository.
